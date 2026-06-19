@@ -94,7 +94,6 @@ Rectangle {
                         id: testItem
                         anchors { left:parent.left; leftMargin:20; right:parent.right }
                         itemData: modelData
-                        onDetailClicked: function(data) { root.detailClicked(data) }
                     }
                 }
             }
@@ -107,6 +106,4 @@ Rectangle {
         height: 40
         onClicked: { _userToggled=true; expanded=!expanded }
     }
-
-    signal detailClicked(var data)
 }

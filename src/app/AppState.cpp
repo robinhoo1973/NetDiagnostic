@@ -26,6 +26,14 @@ AppState::AppState(QObject* parent) : QObject(parent) {
     m_engine = new DiagnosticEngine(std::move(cmd), this);
 
     QObject::connect(m_engine, &DiagnosticEngine::destroyed, this, [this]() { m_engine = nullptr; });
+
+    // ARM64 workaround: C++ QTimer more reliable than QML Timers for polling
+    auto* pollTimer = new QTimer(this);
+    pollTimer->setInterval(200);
+    QObject::connect(pollTimer, &QTimer::timeout, this, [this]() {
+        emit progressChanged();
+    });
+    pollTimer->start();
 }
 
 AppState::~AppState() {

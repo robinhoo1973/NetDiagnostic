@@ -82,7 +82,6 @@ public:
     QVariantList allGroupStats() const;
     Q_INVOKABLE void showDetailDialog(int testIdInt);
     Q_INVOKABLE QVariantMap getDetailResult(int testIdInt) const;
-    Q_PROPERTY(int resultsVersion READ resultsVersion NOTIFY progressChanged)
     int resultsVersion() const { return m_resultsVersion; }
 
 signals:
