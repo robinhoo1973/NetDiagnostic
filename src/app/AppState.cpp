@@ -31,8 +31,14 @@ AppState::AppState(QObject* parent) : QObject(parent) {
     auto* pollTimer = new QTimer(this);
     pollTimer->setInterval(200);
     QObject::connect(pollTimer, &QTimer::timeout, this, [this]() {
+        // ARM64 workaround: periodically re-emit ALL NOTIFY signals so QML
+        // bindings that may have missed the original signal will re-evaluate.
         emit progressChanged();
-        emit runStatusChanged();  // ARM64: force re-evaluation of all runStatus-dependent QML bindings
+        emit runStatusChanged();
+        emit targetChanged();
+        emit currentTestChanged();
+        emit groupChanged();
+        emit portScanConfigChanged();
     });
     pollTimer->start();
 }
