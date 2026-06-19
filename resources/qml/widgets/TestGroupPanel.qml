@@ -30,7 +30,7 @@ Rectangle {
     Timer {
         id: pollTimer
         interval: 300
-        running: isRunning || appState.runStatus === 1
+        running: true
         repeat: true
         onTriggered: reloadModel()
     }
@@ -50,7 +50,7 @@ Rectangle {
             spacing: 8
             Rectangle { width:3; height:24; radius:2; color:isRunning?"#00BCD4":"#0078D4" }
             ColumnLayout { spacing:1
-                Label { text:appState.groupLabels[groupIndex]||("Group"+(groupIndex+1)); font.family:"JetBrains Mono"; font.pixelSize:13; font.weight:Font.DemiBold; color:"#E0E0E0" }
+                Label { text:"G"+(groupIndex+1)+": "+(appState.groupLabels[groupIndex]||""); font.family:"JetBrains Mono"; font.pixelSize:13; font.weight:Font.DemiBold; color:"#E0E0E0" }
                 Label { visible:isRunning; text:"Running: "+(appState.currentTestLabel||"")+"..."; font.family:"JetBrains Mono"; font.pixelSize:10; font.italic:true; color:"#00BCD4"; elide:Text.ElideRight }
             }
             Item { Layout.fillWidth:true }

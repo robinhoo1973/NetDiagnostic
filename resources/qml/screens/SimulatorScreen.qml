@@ -128,7 +128,7 @@ ApplicationWindow {
                         anchors.verticalCenterOffset: deviceFrame.d.island ? -15 : 0
                         width: deviceFrame.sw; height: deviceFrame.sh
                         radius: deviceFrame.d.radius
-                        color: "#1E1E2E"
+                        color: "#2E2E4E"
                         clip: true
 
                         // Status bar

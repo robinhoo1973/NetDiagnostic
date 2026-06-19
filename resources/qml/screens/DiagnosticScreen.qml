@@ -298,25 +298,27 @@ Item {
                 MouseArea { anchors.fill: parent; onClicked: detailOverlay.visible = false }
             }
 
-            ScrollView {
+            Flickable {
                 anchors { fill: parent; margins: 16; topMargin: 36 }
                 clip: true
-                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                contentWidth: width
+                contentHeight: detailCol.height
                 Column {
-                    id: detailCol; width: parent.width; spacing: 8
-                    Label { id: dtTitle; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 16; font.weight: Font.DemiBold; color: "#FFFFFF"; width: parent.width }
-                    Label { id: dtStatus; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 12; color: "#A0A0B8"; width: parent.width }
-                    Label { id: dtSummary; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 12; color: "#E0E0E0"; wrapMode: Text.WordWrap; width: parent.width }
-                    Rectangle { width: parent.width; height: 1; color: "#3A3A5A" }
+                    id: detailCol
+                    width: parent.width; spacing: 8
+                    Label { id: dtTitle; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 16; font.weight: Font.DemiBold; color: "#FFFFFF"; width: detailCol.width }
+                    Label { id: dtStatus; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 12; color: "#A0A0B8"; width: detailCol.width }
+                    Label { id: dtSummary; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 12; color: "#E0E0E0"; wrapMode: Text.WordWrap; width: detailCol.width }
+                    Rectangle { width: detailCol.width; height: 1; color: "#3A3A5A" }
                     Repeater {
                         model: currentDetail.properties || []
                         delegate: Row {
                             spacing: 4
                             Label { text: (modelData.label||"?")+":"; font.family:"JetBrains Mono"; font.pixelSize:11; font.weight:Font.DemiBold; color:"#A0A0B8"; width:120 }
-                            Label { text: modelData.value||""; font.family:"JetBrains Mono"; font.pixelSize:11; color:"#E0E0E0"; width:parent.width-124; wrapMode:Text.WordWrap }
+                            Label { text: modelData.value||""; font.family:"JetBrains Mono"; font.pixelSize:11; color:"#E0E0E0"; width:detailCol.width-124; wrapMode:Text.WordWrap }
                         }
                     }
-                    Label { id: dtOutput; text: ""; font.family:"JetBrains Mono"; font.pixelSize:10; color:"#A0A0B8"; wrapMode:Text.WordWrap; width:parent.width; visible:text!=="" }
+                    Label { id: dtOutput; text: ""; font.family:"JetBrains Mono"; font.pixelSize:10; color:"#A0A0B8"; wrapMode:Text.WordWrap; width:detailCol.width; visible:text!=="" }
                 }
             }
         }
