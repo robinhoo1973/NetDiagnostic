@@ -329,9 +329,47 @@ install_mingw64() {
     echo -e "  ${RED}✗ mingw-w64 build failed${NC}"; return 1
 }
 
-# ── aarch64 (ARM64) Windows cross-compiler wrapper ─────────────────────────
-install_mingw64_arm64() {
-    install_mingw64 "aarch64-w64-mingw32" "${GLOBAL_PREFIX}/mingw-w64-arm64"
+# ── aarch64 (ARM64) Windows cross-compiler via LLVM-MinGW ─────────────────
+# GCC does NOT support aarch64-w64-mingw32 (only Clang/LLVM does).
+# We use the pre-built LLVM-MinGW toolchain from mstorsjo/llvm-mingw.
+install_llvm_mingw_arm64() {
+    local prefix="${GLOBAL_PREFIX}/llvm-mingw-arm64"
+    local toolchain_ver="20260616"  # update when new releases are available
+
+    if [[ -x "${prefix}/bin/aarch64-w64-mingw32-clang++" ]]; then
+        echo -e "  ${GREEN}✓ llvm-mingw-arm64 already installed at ${prefix}${NC}"
+        export PATH="${prefix}/bin:${PATH}"
+        return 0
+    fi
+
+    echo -e "\n${BOLD}── Installing LLVM-MinGW for Windows ARM64 (~77 MB) ──${NC}"
+    _ensure_dir "$prefix" || return 1
+
+    local tarball="llvm-mingw-${toolchain_ver}-ucrt-ubuntu-22.04-aarch64.tar.xz"
+    local url="https://github.com/mstorsjo/llvm-mingw/releases/download/${toolchain_ver}/${tarball}"
+    local dest="${TMP_SRC}/${tarball}"
+
+    echo -e "  ${CYAN}→ Downloading ${tarball}...${NC}"
+    if ! curl -fsSL "$url" -o "$dest" 2>/dev/null; then
+        echo -e "  ${RED}✗ Download failed — try a newer toolchain_ver in the script${NC}"
+        return 1
+    fi
+
+    echo -e "  ${CYAN}→ Extracting to ${prefix}...${NC}"
+    rm -rf "$prefix"
+    mkdir -p "$prefix"
+    tar xf "$dest" -C "$prefix" --strip-components=1 2>/dev/null || {
+        echo -e "  ${RED}✗ Extraction failed${NC}"; rm -f "$dest"; return 1
+    }
+    rm -f "$dest"
+
+    if [[ -x "${prefix}/bin/aarch64-w64-mingw32-clang++" ]]; then
+        export PATH="${prefix}/bin:${PATH}"
+        echo -e "  ${GREEN}✓ llvm-mingw-arm64 installed to ${prefix}${NC}"
+        echo -e "  ${GREEN}  $("${prefix}/bin/aarch64-w64-mingw32-clang++" --version | head -1)${NC}"
+        return 0
+    fi
+    echo -e "  ${RED}✗ llvm-mingw-arm64 install failed${NC}"; return 1
 }
 
 install_qt6_mingw() {
@@ -527,12 +565,15 @@ TCEOF
     echo -e "  ${RED}✗ Qt6 source build failed${NC}"; return 1
 }
 
-# ── aarch64 Windows Qt6 wrapper ──────────────────────────────────────────
+# ── aarch64 Windows Qt6 source build (requires LLVM-MinGW, not GCC) ─────
+# NOTE: This is not auto-invoked by --fix. Building Qt6 for Windows ARM64
+# from source requires LLVM-MinGW and significant Qt6 configure adjustments.
+# Pre-built Qt6 for Windows ARM64 is available via MSYS2 clangarm64 / vcpkg.
 install_qt6_mingw_arm64_source() {
     install_qt6_mingw_source \
         "aarch64-w64-mingw32" \
         "${GLOBAL_PREFIX}/Qt6-mingw-arm64" \
-        "${GLOBAL_PREFIX}/mingw-w64-arm64"
+        "${GLOBAL_PREFIX}/llvm-mingw-arm64"
 }
 
 install_crossbuild_amd64() {
@@ -734,42 +775,33 @@ run_dep_check() {
             fi
         fi
 
-        # Windows ARM64 — aarch64 mingw-w64
-        local AARCH64_GXX="${GLOBAL_PREFIX}/mingw-w64-arm64/bin/aarch64-w64-mingw32-g++"
+        # Windows ARM64 — LLVM-MinGW (Clang-based, GCC doesn't support this target)
+        local LLVM_GXX="${GLOBAL_PREFIX}/llvm-mingw-arm64/bin/aarch64-w64-mingw32-clang++"
         local have_aarch64=false
-        command -v aarch64-w64-mingw32-g++ &>/dev/null && have_aarch64=true
-        [[ -x "$AARCH64_GXX" ]] && { have_aarch64=true; export PATH="${GLOBAL_PREFIX}/mingw-w64-arm64/bin:${PATH}"; }
+        command -v aarch64-w64-mingw32-clang++ &>/dev/null && have_aarch64=true
+        [[ -x "$LLVM_GXX" ]] && { have_aarch64=true; export PATH="${GLOBAL_PREFIX}/llvm-mingw-arm64/bin:${PATH}"; }
 
         if $have_aarch64; then
-            _d_ok "aarch64-w64-mingw32-g++ ($($(command -v aarch64-w64-mingw32-g++) -dumpversion 2>/dev/null || echo installed))"
+            _d_ok "aarch64-w64-mingw32-clang++ ($($(command -v aarch64-w64-mingw32-clang++) --version 2>/dev/null | head -1 || echo installed))"
+            # Qt6 for Windows ARM64 is not built from source here.
+            # Pre-built packages: MSYS2 clangarm64, or vcpkg arm64-windows.
             local aq_found=false aq_dir=""
             for p in "${GLOBAL_PREFIX}/Qt6-mingw-arm64/"*"/lib/cmake/Qt6" \
                      /usr/aarch64-w64-mingw32/lib/cmake/Qt6; do
                 [[ -d $p ]] && { aq_found=true; aq_dir="$p"; break; }
             done
-            if $aq_found; then
-                _d_ok "  Qt6 aarch64 mingw ($aq_dir)"
-            elif $FIX_DEPS; then
-                echo -e "  ${CYAN}→ Installing Qt6 for aarch64 mingw-w64...${NC}"
-                install_qt6_mingw_arm64_source && _d_ok "  Qt6 aarch64 mingw (installed)" \
-                    || _d_fail "  Qt6 aarch64 mingw" "install failed"
-            else
-                _d_warn "  Qt6 aarch64 mingw" "not found — retry with --fix"
-            fi
+            $aq_found && _d_ok "  Qt6 aarch64 mingw ($aq_dir)" \
+                || _d_warn "  Qt6 aarch64 mingw" "not found — pre-built Qt6 required (MSYS2 clangarm64, vcpkg)"
         else
             if $FIX_DEPS; then
-                echo -e "  ${CYAN}→ Auto-installing aarch64 mingw-w64 from source...${NC}"
-                if install_mingw64_arm64; then
-                    export PATH="${GLOBAL_PREFIX}/mingw-w64-arm64/bin:${PATH}"
-                    _d_ok "aarch64 mingw-w64 (installed from source)"
-                    echo -e "  ${CYAN}→ Installing Qt6 for aarch64 mingw-w64...${NC}"
-                    install_qt6_mingw_arm64_source && _d_ok "  Qt6 aarch64 mingw (installed)" \
-                        || _d_fail "  Qt6 aarch64 mingw" "install failed"
+                echo -e "  ${CYAN}→ Auto-installing LLVM-MinGW for Windows ARM64...${NC}"
+                if install_llvm_mingw_arm64; then
+                    _d_ok "llvm-mingw-arm64 (installed)"
                 else
-                    _d_fail "aarch64 mingw-w64" "build from source failed"
+                    _d_fail "llvm-mingw-arm64" "install failed"
                 fi
             else
-                _d_skip "windows-arm64 target (no aarch64 mingw) — retry with --fix"
+                _d_skip "windows-arm64 target (no llvm-mingw) — retry with --fix"
             fi
         fi
     fi
@@ -876,17 +908,18 @@ build_windows_x86_64() {
     [[ "$SIM_MODE" != "off" ]]  && build_sim "windows-x86_64" "Windows" "x86_64" "$mingw_qt" "$tc" "$flgs"
 }
 build_windows_arm64() {
-    local gxx; gxx="$(command -v aarch64-w64-mingw32-g++ 2>/dev/null || echo "")"
-    [[ -z "$gxx" && -x "${GLOBAL_PREFIX}/mingw-w64-arm64/bin/aarch64-w64-mingw32-g++" ]] && gxx="${GLOBAL_PREFIX}/mingw-w64-arm64/bin/aarch64-w64-mingw32-g++"
-    [[ -z "$gxx" ]] && { warn "aarch64 mingw missing — skip (try --fix)"; return 0; }
-    export PATH="$(dirname "$gxx"):${PATH}"
+    # Uses LLVM-MinGW (Clang), not GCC — only Clang supports aarch64-w64-mingw32
+    local cxx; cxx="$(command -v aarch64-w64-mingw32-clang++ 2>/dev/null || echo "")"
+    [[ -z "$cxx" && -x "${GLOBAL_PREFIX}/llvm-mingw-arm64/bin/aarch64-w64-mingw32-clang++" ]] && cxx="${GLOBAL_PREFIX}/llvm-mingw-arm64/bin/aarch64-w64-mingw32-clang++"
+    [[ -z "$cxx" ]] && { warn "llvm-mingw-arm64 missing — skip (try --fix)"; return 0; }
+    export PATH="$(dirname "$cxx"):${PATH}"
     local mingw_qt=""
     for p in "${GLOBAL_PREFIX}/Qt6-mingw-arm64/"*"/lib/cmake/Qt6" \
              /usr/aarch64-w64-mingw32/lib/cmake/Qt6; do
         [[ -d "$p" ]] && { mingw_qt="$p"; break; }
     done
     [[ -z "$mingw_qt" ]] && { warn "Qt6 aarch64 mingw missing — skip (try --fix)"; return 0; }
-    local tc="$TC_DIR/windows-arm64.cmake"; local flgs="-O2 -static-libgcc -static-libstdc++ -static"
+    local tc="$TC_DIR/windows-arm64.cmake"; local flgs="-O2"
     [[ "$SIM_MODE" != "only" ]] && build_one "windows-arm64" "Windows" "arm64" "$mingw_qt" "$tc" "$flgs"
     [[ "$SIM_MODE" != "off" ]]  && build_sim "windows-arm64" "Windows" "arm64" "$mingw_qt" "$tc" "$flgs"
 }
