@@ -1,4 +1,5 @@
 import QtQuick
+import "../theme"
 import QtQuick.Controls
 import QtQuick.Layouts
 import "../widgets"
@@ -19,7 +20,7 @@ Item {
             anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
             AppIcon { name: "report"; size: 20; color: Theme.cyan }
             Item { width: 10 }
-            Label { text: "Report Preview"; font.family: "JetBrains Mono"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
+            Label { text: Tr.reportPreview; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
         }
     }
 
@@ -48,26 +49,26 @@ Item {
             // Title
             Label {
                 Layout.alignment: Qt.AlignHCenter
-                text: "Report Preview"
-                font.family: "JetBrains Mono"; font.pixelSize: 22; font.weight: Font.DemiBold; color: Theme.textPrimary
+                text: Tr.reportPreview
+                font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 22; font.weight: Font.DemiBold; color: Theme.textPrimary
             }
             Item { Layout.preferredHeight: 12 }
 
             // Subtitle
             Label {
                 Layout.alignment: Qt.AlignHCenter
-                text: "Report generation and preview will be\nimplemented in Phase 9."
-                font.family: "JetBrains Mono"; font.pixelSize: 14; color: Qt.alpha(Theme.textSecondary, 0.6)
+                text: Tr.reportPlaceholder
+                font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 14; color: Qt.alpha(Theme.textSecondary, 0.6)
                 horizontalAlignment: Text.AlignHCenter; lineHeight: 1.5
             }
             Item { Layout.preferredHeight: 24 }
 
             // Feature rows (Flutter: Icon 16px accentBlue 70% + SizedBox(10) + Text 13px textSecondary 70%)
             ColumnLayout { spacing: 10; Layout.alignment: Qt.AlignHCenter
-                FeatureRow { featureIcon: "📄"; featureText: "Export to PDF format" }
-                FeatureRow { featureIcon: "📤"; featureText: "Share reports via email" }
-                FeatureRow { featureIcon: "🌐"; featureText: "HTML report with embedded charts" }
-                FeatureRow { featureIcon: "⏱";  featureText: "Historical report comparison" }
+                FeatureRow { featureIcon: "report"; featureText: Tr.reportFeaturePdf }
+                FeatureRow { featureIcon: "target"; featureText: Tr.reportFeatureEmail }
+                FeatureRow { featureIcon: "globe"; featureText: Tr.reportFeatureHtml }
+                FeatureRow { featureIcon: "timer";  featureText: Tr.reportFeatureHistory }
             }
             Item { Layout.preferredHeight: 32 }
 
@@ -80,11 +81,11 @@ Item {
                 RowLayout {
                     id: statusRow
                     anchors.centerIn: parent
-                    Label { text: hasResults ? "✓" : "ℹ"; font.pixelSize: 16; color: hasResults ? Theme.passGreen : Theme.warnYellow }
+                    AppIcon { name: hasResults ? "badge-check" : "badge-info"; size: 12; color: "white" }
                     Item { width: 8 }
                     Label {
-                        text: hasResults ? appState.totalCompleted + " results available" : "No diagnostic results"
-                        font.family: "JetBrains Mono"; font.pixelSize: 12; color: hasResults ? Theme.passGreen : Theme.warnYellow
+                        text: hasResults ? appState.totalCompleted + Tr.reportResultsAvailable : Tr.reportNoResults
+                        font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12; color: hasResults ? Theme.passGreen : Theme.warnYellow
                     }
                 }
             }
@@ -94,8 +95,8 @@ Item {
 
     component FeatureRow: RowLayout {
         property string featureIcon: ""; property string featureText: ""
-        Label { text: featureIcon; font.pixelSize: 16; color: Qt.alpha(Theme.accentBlue, 0.7) }
+        AppIcon { name: featureIcon; size: 16; color: Qt.alpha(Theme.accentBlue, 0.7) }
         Item { width: 10 }
-        Label { text: featureText; font.family: "JetBrains Mono"; font.pixelSize: 13; color: Qt.alpha(Theme.textSecondary, 0.7) }
+        Label { text: featureText; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 13; color: Qt.alpha(Theme.textSecondary, 0.7) }
     }
 }

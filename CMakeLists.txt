@@ -8,21 +8,21 @@ set(CMAKE_AUTORCC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS
     Core Concurrent Quick QuickControls2 Widgets
-    Network LinguistTools
+    Network
 )
-
-add_subdirectory(native)
+# LinguistTools: optional — only needed for .ts translation file compilation
+find_package(Qt6LinguistTools QUIET)
 
 set(SOURCES
     src/main.cpp
     src/models/DiagnosticResult.cpp
     src/util/Logger.cpp
     src/util/PingParser.cpp
-    src/engine/PlatformCommand.cpp
     src/engine/runner/NetworkProbe.cpp
     src/app/AppState.cpp
     src/app/NativeService.cpp
     src/engine/diagnostic/DiagnosticEngine.cpp
+    src/engine/diagnostic/G1G2G3Native.cpp
     src/engine/diagnostic/G4RemoteHost.cpp
     src/engine/diagnostic/G5WebsiteUrl.cpp
 )
@@ -35,11 +35,18 @@ qt_add_executable(net_diagnostic ${SOURCES} ${QML_RESOURCES})
 
 target_link_libraries(net_diagnostic PRIVATE
     Qt6::Core Qt6::Concurrent Qt6::Quick Qt6::QuickControls2
-    Qt6::Widgets Qt6::Network nd_plugin
+    Qt6::Widgets Qt6::Network
+    resolv curl
 )
+if(MINGW)
+    target_link_libraries(net_diagnostic PRIVATE
+        ws2_32 winhttp iphlpapi wlanapi
+        ole32 shell32 user32 gdi32
+    )
+endif()
 
 target_include_directories(net_diagnostic PRIVATE
-    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/native
+    ${CMAKE_SOURCE_DIR}/src
 )
 
 option(BUILD_TESTS "Build test suite" OFF)
@@ -58,9 +65,15 @@ if(BUILD_SIMULATOR)
     qt_add_executable(net_diagnostic_sim ${SIM_SOURCES} ${QML_RESOURCES})
     target_link_libraries(net_diagnostic_sim PRIVATE
         Qt6::Core Qt6::Concurrent Qt6::Quick Qt6::QuickControls2
-        Qt6::Widgets Qt6::Network nd_plugin
+        Qt6::Widgets Qt6::Network
     )
+    if(MINGW)
+        target_link_libraries(net_diagnostic_sim PRIVATE
+            ws2_32 winhttp iphlpapi wlanapi
+            ole32 shell32 user32 gdi32
+        )
+    endif()
     target_include_directories(net_diagnostic_sim PRIVATE
-        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/native
+        ${CMAKE_SOURCE_DIR}/src
     )
 endif()

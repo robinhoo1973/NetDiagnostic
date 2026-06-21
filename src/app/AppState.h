@@ -9,13 +9,12 @@
 #include <QSet>
 #include <QFuture>
 #include <atomic>
+#include <cstdint>
 #include <memory>
-#include "models/TestId.h"
+#include "models/DiagId.h"
 #include "models/DiagnosticResult.h"
 
 class DiagnosticEngine;
-class PlatformCommand;
-
 enum class RunStatus { Idle, Running, Completed, Cancelled, Error };
 
 class AppState : public QObject {
@@ -35,6 +34,8 @@ class AppState : public QObject {
     Q_PROPERTY(int portScanFrom READ portScanFrom WRITE setPortScanFrom NOTIFY portScanConfigChanged)
     Q_PROPERTY(int portScanTo READ portScanTo WRITE setPortScanTo NOTIFY portScanConfigChanged)
     Q_PROPERTY(int resultsVersion READ resultsVersion NOTIFY progressChanged)
+    Q_PROPERTY(int stateVersion READ stateVersion NOTIFY stateVersionChanged)
+    Q_PROPERTY(int languageIndex READ languageIndex NOTIFY languageChanged)
 
 public:
     explicit AppState(QObject* parent = nullptr);
@@ -77,12 +78,15 @@ public:
     Q_INVOKABLE bool isGroupAnyEnabled(int groupInt) const;
     Q_INVOKABLE QVariantList resultsForGroup(int groupInt) const;
     Q_INVOKABLE QVariantList allTestsForGroup(int groupInt) const;
-    Q_INVOKABLE QVariantList allTestIdsForGroup(int groupInt) const;
+    Q_INVOKABLE QVariantList allDiagIdsForGroup(int groupInt) const;
     Q_INVOKABLE QVariantMap groupStats(int groupInt) const;
     QVariantList allGroupStats() const;
     Q_INVOKABLE void showDetailDialog(int testIdInt);
     Q_INVOKABLE QVariantMap getDetailResult(int testIdInt) const;
+    int stateVersion() const { return m_stateGeneration.load(std::memory_order_acquire); }
     int resultsVersion() const { return m_resultsVersion; }
+    int languageIndex() const { return m_languageIndex; }
+    Q_INVOKABLE void setLanguage(int index);
 
     // ── Target type helpers (centralised — used by QML canEnable and C++ logic) ─
     Q_INVOKABLE bool isTargetEmpty() const { return m_target.trimmed().isEmpty(); }
@@ -102,6 +106,13 @@ public:
     // True if non-empty and not a URL (no :// scheme)
     Q_INVOKABLE bool isTargetHost() const { return !isTargetEmpty() && !hasUrlScheme(); }
     // Debug helper — prints to stderr and returns isTargetHttpUrl result
+    Q_INVOKABLE bool canRun() const {
+        if (m_runStatus == RunStatus::Running) return false;
+        for (int g = 0; g < 5; ++g) {
+            if (isGroupAnyEnabled(g)) return true;
+        }
+        return false;
+    }
     Q_INVOKABLE bool debugTargetUrl() const {
         const QString t = m_target.trimmed();
         bool r = isTargetHttpUrl();
@@ -123,15 +134,18 @@ signals:
     void portScanConfigChanged();
     void testCompleted(int testIdInt);
     void resultsReset();
+    void stateVersionChanged();
+    void languageChanged();
 
 private slots:
-    void onTestFinished(TestId id, DiagnosticResult result);
+    void onTestFinished(DiagId id, DiagnosticResult result);
 
 private:
     void startNextGroup();
     void runTestInGroup(int groupIdx, int testIdx);
     Q_INVOKABLE QString testDisplayName(int testIdInt) const;
-    static QString staticTestDisplayName(TestId id);
+    static QString staticTestDisplayName(DiagId id);
+    void bumpVersion();
 
     DiagnosticEngine* m_engine = nullptr;
 
@@ -148,15 +162,17 @@ private:
     int m_portScanFrom = 0;
     int m_portScanTo = 0;
 
-    QSet<TestId> m_enabledTests; // all enabled by default
-    QMap<TestId, DiagnosticResult> m_results;
-    QMap<TestGroup, int> m_completedPerGroup;
-    QMap<TestGroup, int> m_totalPerGroup;
+    QSet<DiagId> m_enabledTests; // all enabled by default
+    QMap<DiagId, DiagnosticResult> m_results;
+    QMap<DiagGroup, int> m_completedPerGroup;
+    QMap<DiagGroup, int> m_totalPerGroup;
 
     // Group-sequential execution
-    struct GroupTask { QList<TestId> testIds; TestGroup group; };
+    struct GroupTask { QList<DiagId> testIds; DiagGroup group; };
     QList<GroupTask> m_pendingGroups;
     int m_currentGroupIdx = 0;
     std::atomic<int> m_activeGroupDone{0};
+    std::atomic<int> m_stateGeneration{0};
     int m_resultsVersion = 0;
+    int m_languageIndex = 0;
 };

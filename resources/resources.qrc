@@ -1,7 +1,10 @@
 <RCC>
     <qresource prefix="/">
+        <file>qml/AppContent.qml</file>
         <file>qml/main.qml</file>
         <file>qml/theme/AppTheme.qml</file>
+        <file>qml/theme/Translations.qml</file>
+        <file>qml/theme/qmldir</file>
         <file>qml/screens/DiagnosticScreen.qml</file>
         <file>qml/screens/DashboardScreen.qml</file>
         <file>qml/screens/ConfigScreen.qml</file>
@@ -37,7 +40,22 @@
         <file>icons/tune.svg</file>
         <file>icons/warning.svg</file>
         <file>icons/wifi.svg</file>
+        <file>icons/mail.svg</file>
+        <file>icons/badge-check.svg</file>
+        <file>icons/badge-close.svg</file>
+        <file>icons/badge-warning.svg</file>
+        <file>icons/badge-info.svg</file>
+        <file>icons/badge-skip.svg</file>
+        <file>icons/badge-error.svg</file>
+        <file>icons/badge-circle.svg</file>
+        <file>icons/badge-refresh.svg</file>
+        <file>icons/spinner.svg</file>
+        <file>icons/apple.svg</file>
+        <file>icons/android.svg</file>
+        <file>icons/linux.svg</file>
+        <file>icons/windows.svg</file>
         <file>fonts/JetBrainsMono-Regular.ttf</file>
         <file>fonts/JetBrainsMono-Bold.ttf</file>
+        <file>fonts/DejaVuSansMono.ttf</file>
     </qresource>
 </RCC>

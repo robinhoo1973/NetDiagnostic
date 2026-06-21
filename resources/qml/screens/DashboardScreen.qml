@@ -1,4 +1,5 @@
 import QtQuick
+import "../theme"
 import QtQuick.Controls
 import QtQuick.Layouts
 import "../widgets"
@@ -7,20 +8,25 @@ import "../widgets"
 Item {
     id: page
     objectName: "dashboard"
-    // ── Polled state (C++ signals unreliable on ARM64) ────────────────
+    // ── Version-based state sync (poll single int, sync on change) ────
+    property int _cachedDashboardGen: -1
     property int _runStatus: 0
     property int _totalCompleted: 0
     Timer {
         interval: 200; running: true; repeat: true
         onTriggered: {
-            _runStatus = appState.runStatus
-            _totalCompleted = appState.totalCompleted
+            var v = appState.stateVersion
+            if (v !== _cachedDashboardGen) {
+                _cachedDashboardGen = v
+                _runStatus = appState.runStatus
+                _totalCompleted = appState.totalCompleted
+            }
         }
     }
     property bool hasData: _totalCompleted > 0 && _runStatus === 2
     readonly property var allStats: appState.allGroupStats || []
 
-    function statusIcon(s) { switch(s) { case 0: return "✓"; case 1: return "⚠"; case 2: return "✗"; case 3: return "⊖"; default: return "ⓘ" } }
+    function statusIcon(s) { switch(s) { case 0: return "badge-check"; case 1: return "badge-warning"; case 2: return "badge-close"; case 3: return "badge-skip"; default: return "badge-info" } }
     function statusColor(s) { switch(s) { case 0: return Theme.passGreen; case 1: return Theme.warnYellow; case 2: return Theme.failRed; case 3: return Theme.skipGray; default: return Theme.accentBlue } }
     function fmtDur(ms) {
         if (ms < 1000) return ms + "ms"
@@ -44,7 +50,7 @@ Item {
             anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
             AppIcon { name: "dashboard"; size: 20; color: Theme.cyan }
             Item { width: 10 }
-            Label { text: "Dashboard"; font.family: "JetBrains Mono"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
+            Label { text: Tr.dashboard; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
             Item { Layout.fillWidth: true }
             // Reset button (Flutter: IconButton refresh)
             Rectangle {
@@ -52,7 +58,7 @@ Item {
                 implicitWidth: 60; implicitHeight: 32; radius: 6; color: "transparent"
                 border { width: 1; color: "#5A5A7A" }
                 MouseArea { anchors.fill: parent; onClicked: appState.reset() }
-                Label { anchors.centerIn: parent; text: "↻ Reset"; font.family: "JetBrains Mono"; font.pixelSize: 12; color: Theme.textSecondary }
+                Label { anchors.centerIn: parent; text: Tr.resetLabel; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12; color: Theme.textSecondary }
             }
         }
     }
@@ -61,8 +67,8 @@ Item {
     Column {
         anchors.centerIn: parent; spacing: 16; visible: !hasData
         AppIcon { anchors.horizontalCenter: parent.horizontalCenter; name: "dashboard"; size: 80; color: Qt.alpha(Theme.textSecondary, 0.2) }
-        Label { anchors.horizontalCenter: parent.horizontalCenter; text: "No diagnostic data yet"; font.family: "JetBrains Mono"; font.pixelSize: 18; font.weight: Font.Medium; color: Qt.alpha(Theme.textSecondary, 0.6) }
-        Label { anchors.horizontalCenter: parent.horizontalCenter; text: "Run a diagnostic from the Diagnostics screen\nto see results here."; font.family: "JetBrains Mono"; font.pixelSize: 13; color: Qt.alpha(Theme.textSecondary, 0.4); horizontalAlignment: Text.AlignHCenter; lineHeight: 1.5 }
+        Label { anchors.horizontalCenter: parent.horizontalCenter; text: Tr.noData; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 18; font.weight: Font.Medium; color: Qt.alpha(Theme.textSecondary, 0.6) }
+        Label { anchors.horizontalCenter: parent.horizontalCenter; text: Tr.runFromDiag; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 13; color: Qt.alpha(Theme.textSecondary, 0.4); horizontalAlignment: Text.AlignHCenter; lineHeight: 1.5 }
     }
 
     Flickable {
@@ -84,30 +90,37 @@ Item {
                     AppIcon { name: "check"; size: 28; color: Theme.passGreen }
                     Item { width: 14 }
                     ColumnLayout { spacing: 4
-                        Label { text: "Diagnostic Run Complete"; font.family: "JetBrains Mono"; font.pixelSize: 16; font.weight: Font.DemiBold; color: Theme.textPrimary }
+                        Label { text: Tr.diagRunComplete; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 16; font.weight: Font.DemiBold; color: Theme.textPrimary }
                         RowLayout { spacing: 4
                             AppIcon { name: "target"; size: 12; color: Theme.textSecondary }
-                            Label { text: "Target: " + (appState.target || "N/A"); font.family: "JetBrains Mono"; font.pixelSize: 12; color: Theme.textSecondary }
+                            Label { text: Tr.targetLabel + (appState.target || Tr.naLabel); font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12; color: Theme.textSecondary }
                         }
                         RowLayout { spacing: 4
                             AppIcon { name: "timer"; size: 12; color: Theme.textSecondary }
-                            Label { text: fmtTimestamp(); font.family: "JetBrains Mono"; font.pixelSize: 12; color: Theme.textSecondary }
+                            Label { text: fmtTimestamp(); font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12; color: Theme.textSecondary }
                         }
                     }
                 }
             }
             Item { Layout.preferredHeight: 24 }
 
-            SummaryCards { Layout.fillWidth: true }
+            SummaryCards { Layout.fillWidth: true; compact: true }
             Item { Layout.preferredHeight: 32 }
 
             // ── Per-Group Results header ────────────────────────────────
-            Label { text: "Per-Group Results"; font.family: "JetBrains Mono"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
+            Label { text: Tr.perGroup; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
             Item { Layout.preferredHeight: 12 }
 
             Repeater {
-                model: appState.groupLabels.length
-                delegate: DashboardGroupRow { groupIndex: index; Layout.fillWidth: true }
+                model: {
+                    var groups = []
+                    for (var g = 0; g < appState.groupLabels.length; g++) {
+                        var s = appState.groupStats(g)
+                        if ((s.enabled || 0) > 0 || (s.total || 0) > 0) groups.push(g)
+                    }
+                    return groups
+                }
+                delegate: DashboardGroupRow { groupIndex: modelData; Layout.fillWidth: true }
             }
             Item { Layout.preferredHeight: 32 }
 
@@ -116,27 +129,34 @@ Item {
                 Layout.fillWidth: true; implicitHeight: sumCol.implicitHeight + 32; radius: 12
                 color: Theme.bgCard; border { width: 1; color: "#2A2A4A" }
                 ColumnLayout { id: sumCol; anchors { fill: parent; margins: 16 }
-                    Label { text: "Summary"; font.family: "JetBrains Mono"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
+                    Label { text: Tr.summary; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
                     Item { Layout.preferredHeight: 16 }
                     RowLayout {
-                    SummaryStat { appIcon: "config"; clr: Theme.cyan; val: appState.totalTests; lbl: "Total Tests" }
+                    SummaryStat { appIcon: "config"; clr: Theme.cyan; val: appState.totalTests; lbl: Tr.totalTestsLabel }
                     Item { width: 24 }
-                    SummaryStat { appIcon: "timer"; clr: Theme.accentBlue; val: calcTotalTime(); lbl: "Total Time" }
+                    SummaryStat { appIcon: "timer"; clr: Theme.accentBlue; val: calcTotalTime(); lbl: Tr.totalTimeLabel }
                     Item { width: 24 }
-                    SummaryStat { appIcon: "check"; clr: Theme.passGreen; val: _totalCompleted; lbl: "Completed" }
+                    SummaryStat { appIcon: "check"; clr: Theme.passGreen; val: _totalCompleted; lbl: Tr.completedLabel }
                     }
                     Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#2A2A4A"; visible: _totalCompleted > 0 }
                     Item { Layout.preferredHeight: 12; visible: _totalCompleted > 0 }
-                    Label { text: "Layer Timings"; font.family: "JetBrains Mono"; font.pixelSize: 12; font.weight: Font.DemiBold; color: Theme.textSecondary; visible: _totalCompleted > 0 }
+                    Label { text: Tr.layerTimings; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12; font.weight: Font.DemiBold; color: Theme.textSecondary; visible: _totalCompleted > 0 }
                     Item { Layout.preferredHeight: 8; visible: _totalCompleted > 0 }
                     Repeater {
-                        model: appState.groupLabels.length
+                        model: {
+                            var groups = []
+                            for (var g = 0; g < appState.groupLabels.length; g++) {
+                                var s = appState.groupStats(g)
+                                if ((s.enabled || 0) > 0 || (s.total || 0) > 0) groups.push(g)
+                            }
+                            return groups
+                        }
                         delegate: RowLayout {
                             visible: hasData
                             Rectangle { implicitWidth: 8; implicitHeight: 8; radius: 2; color: Theme.accentBlue }
                             Item { width: 10 }
-                            Label { Layout.fillWidth: true; text: appState.groupLabels[index] || ""; font.family: "JetBrains Mono"; font.pixelSize: 12; color: Theme.textPrimary }
-                            Label { text: calcLayerTiming(index); font.family: "JetBrains Mono"; font.pixelSize: 12; color: Theme.textSecondary }
+                            Label { Layout.fillWidth: true; text: Tr.groupName(modelData); font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12; color: Theme.textPrimary }
+                            Label { text: calcLayerTiming(modelData); font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12; color: Theme.textSecondary }
                         }
                     }
                 }
@@ -148,7 +168,7 @@ Item {
     // ── Helper functions ────────────────────────────────────────────────
     function calcGroupStat(idx) {
         var s = appState.groupStats(idx);
-        return s || {pass:0,warn:0,fail:0,skip:0,total:0,enabled:0}
+        return s || {pass:0,warn:0,fail:0,skip:0,info:0,total:0,enabled:0}
     }
     function getDurFromResults(groupIdx) {
         var results = appState.resultsForGroup(groupIdx)
@@ -181,13 +201,14 @@ Item {
             RowLayout {
                 Rectangle { Layout.preferredWidth: 3; implicitHeight: 20; radius: 2; color: Theme.accentBlue }
                 Item { width: 10 }
-                Label { Layout.fillWidth: true; text: appState.groupLabels[groupIndex] || ""; font.family: "JetBrains Mono"; font.pixelSize: 13; font.weight: Font.DemiBold; color: Theme.textPrimary }
+                Label { Layout.fillWidth: true; text: Tr.groupName(groupIndex); font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 13; font.weight: Font.DemiBold; color: Theme.textPrimary }
                 DashboardBadge { accent: Theme.passGreen;  v: calcGroupStat(groupIndex).pass }
                 DashboardBadge { accent: Theme.warnYellow; v: calcGroupStat(groupIndex).warn }
                 DashboardBadge { accent: Theme.failRed;   v: calcGroupStat(groupIndex).fail }
                 DashboardBadge { accent: Theme.skipGray;  v: calcGroupStat(groupIndex).skip }
+                DashboardBadge { accent: Theme.accentBlue; v: calcGroupStat(groupIndex).info||0 }
                 Item { width: 8 }
-                Label { text: getDurFromResults(groupIndex); font.family: "JetBrains Mono"; font.pixelSize: 11; color: Theme.textSecondary }
+                Label { text: getDurFromResults(groupIndex); font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 11; color: Theme.textSecondary }
             }
             Rectangle { Layout.fillWidth: true; implicitHeight: 4; radius: 2; color: "#2A2A4A"
                 Rectangle {
@@ -201,10 +222,10 @@ Item {
                 id: dashResultsRepeater
                 model: appState.resultsForGroup(groupIndex)
                 delegate: RowLayout {
-                    Label { text: page.statusIcon(modelData.status); font.pixelSize: 12; color: page.statusColor(modelData.status) }
+                    AppIcon { name: page.statusIcon(modelData.status); size: 10; color: "white" }
                     Item { width: 6 }
-                    Label { Layout.fillWidth: true; text: modelData.displayName||""; font.family:"JetBrains Mono"; font.pixelSize:11; color:Theme.textSecondary; elide:Text.ElideRight }
-                    Label { text: page.fmtDur(modelData.durationMs); font.family:"JetBrains Mono"; font.pixelSize:10; color:Qt.alpha(Theme.textSecondary,0.6) }
+                    Label { Layout.fillWidth: true; text: modelData.displayName||""; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:11; color:Theme.textSecondary; elide:Text.ElideRight }
+                    Label { text: page.fmtDur(modelData.durationMs); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:10; color:Qt.alpha(Theme.textSecondary,0.6) }
                 }
             }
         }
@@ -213,7 +234,7 @@ Item {
     component DashboardBadge: Rectangle {
         property color accent: Theme.passGreen; property int v: 0
         visible: v > 0; implicitWidth: 22; implicitHeight: 16; radius: 4; color: Qt.alpha(accent, 0.15)
-        Label { anchors.centerIn: parent; text: v; font.family: "JetBrains Mono"; font.pixelSize: 10; font.weight: Font.Bold; color: accent }
+        Label { anchors.centerIn: parent; text: v; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; font.weight: Font.Bold; color: accent }
     }
 
     component SummaryStat: RowLayout {
@@ -221,8 +242,8 @@ Item {
         AppIcon { name: appIcon; size: 20; color: clr }
         Item { width: 8 }
         ColumnLayout { spacing: 0
-            Label { text: val; font.family: "JetBrains Mono"; font.pixelSize: 22; font.weight: Font.Bold; color: Theme.textPrimary }
-            Label { text: lbl; font.family: "JetBrains Mono"; font.pixelSize: 10; color: Theme.textSecondary }
+            Label { text: val; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 22; font.weight: Font.Bold; color: Theme.textPrimary }
+            Label { text: lbl; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; color: Theme.textSecondary }
         }
     }
 }

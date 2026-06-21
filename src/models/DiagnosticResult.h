@@ -6,13 +6,13 @@
 #include <QString>
 #include <QDateTime>
 #include <QVector>
-#include "TestId.h"
+#include "DiagId.h"
 #include "ResultProperty.h"
 
 struct DiagnosticResult {
-    TestId      id;
+    DiagId      id;
     QString     displayName;
-    TestGroup   group;
+    DiagGroup   group;
     TestStatus  status;
     QString     summary;
     QString     details;
@@ -33,7 +33,7 @@ struct DiagnosticResult {
     QString statusIcon() const { return testStatusIcon(status); }
 
     // ── Factory helpers ──────────────────────────────────────────────────────
-    static DiagnosticResult skipped(TestId id, const QString& reason);
-    static DiagnosticResult error(TestId id, const QString& msg);
-    static DiagnosticResult timeout(TestId id, TestGroup group, qint64 durationMs);
+    static DiagnosticResult skipped(DiagId id, const QString& reason);
+    static DiagnosticResult error(DiagId id, const QString& msg);
+    static DiagnosticResult timeout(DiagId id, DiagGroup group, qint64 durationMs);
 };

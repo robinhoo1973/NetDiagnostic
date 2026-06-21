@@ -1,4 +1,5 @@
 import QtQuick
+import "../theme"
 import QtQuick.Controls
 import QtQuick.Layouts
 
@@ -56,8 +57,8 @@ Rectangle {
             AppIcon { name: "info"; size: 14; color: Theme.accentBlue }
             Item { width: 6 }
             Label {
-                text: "Target Analysis"
-                font.family: "JetBrains Mono"; font.pixelSize: 11
+                text: Tr.targetAnalysis
+                font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 11
                 font.weight: Font.DemiBold; color: Theme.accentBlue
             }
         }
@@ -65,18 +66,18 @@ Rectangle {
 
         // Type
         RowLayout {
-            Label { text: "Type    :"; font.family: "JetBrains Mono"; font.pixelSize: 10; font.weight: Font.DemiBold; color: Theme.textSecondary }
+            Label { text: Tr.targetTypeLabel; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; font.weight: Font.DemiBold; color: Theme.textSecondary }
             Label {
-                text: isUrl ? "URL" : (isIp ? "Remote Host (IP)" : (target !== "" ? "Remote Host (Hostname)" : ""))
-                font.family: "JetBrains Mono"; font.pixelSize: 10; color: Theme.textPrimary
+                text: isUrl ? Tr.targetTypeUrl : (isIp ? Tr.targetTypeIp : (target !== "" ? Tr.targetTypeHostname : ""))
+                font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; color: Theme.textPrimary
             }
         }
         // Host
         RowLayout {
-            Label { text: "Host    :"; font.family: "JetBrains Mono"; font.pixelSize: 10; font.weight: Font.DemiBold; color: Theme.textSecondary }
+            Label { text: "Host    :"; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; font.weight: Font.DemiBold; color: Theme.textSecondary }
             Label {
                 text: host
-                font.family: "JetBrains Mono"; font.pixelSize: 10; color: Theme.textPrimary
+                font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; color: Theme.textPrimary
             }
         }
         // IP Classification
@@ -84,7 +85,7 @@ Rectangle {
             visible: isIp
             leftPadding: 70
             text: classifyIp(host)
-            font.family: "JetBrains Mono"; font.pixelSize: 10; color: Theme.textSecondary
+            font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; color: Theme.textSecondary
         }
 
         // URL component breakdown
@@ -114,8 +115,8 @@ Rectangle {
                 }
                 delegate: RowLayout {
                     property var pair: modelData
-                    Label { text: (pair[0] + "       ").substring(0,8) + ":"; font.family: "JetBrains Mono"; font.pixelSize: 10; font.weight: Font.DemiBold; color: Theme.textSecondary }
-                    Label { text: pair[1] || ""; font.family: "JetBrains Mono"; font.pixelSize: 10; color: Theme.textPrimary }
+                    Label { text: (pair[0] + "       ").substring(0,8) + ":"; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; font.weight: Font.DemiBold; color: Theme.textSecondary }
+                    Label { text: pair[1] || ""; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; color: Theme.textPrimary }
                 }
             }
         }
@@ -123,8 +124,8 @@ Rectangle {
         Item { Layout.preferredHeight: 4 }
         // Known Port Reference
         Label {
-            text: "Known Port Reference"
-            font.family: "JetBrains Mono"; font.pixelSize: 9; color: Theme.textSecondary
+            text: Tr.knownPortRef
+            font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 9; color: Theme.textSecondary
         }
         Item { Layout.preferredHeight: 2 }
         Repeater {
@@ -135,13 +136,13 @@ Rectangle {
                 property var b: (idx + 1 < portRef.length) ? portRef[idx + 1] : null
                 Label {
                     text: ("     " + a[0]).slice(-5) + " " + a[1]
-                    font.family: "JetBrains Mono"; font.pixelSize: 9; color: Theme.cyan
+                    font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 9; color: Theme.cyan
                     Layout.preferredWidth: 110
                 }
                 Label {
                     visible: b !== null
                     text: ("     " + b[0]).slice(-5) + " " + b[1]
-                    font.family: "JetBrains Mono"; font.pixelSize: 9; color: Theme.textSecondary
+                    font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 9; color: Theme.textSecondary
                     Layout.preferredWidth: 110
                 }
             }

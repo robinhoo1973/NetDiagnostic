@@ -1,5 +1,5 @@
 // =============================================================================
-// G5WebsiteUrl.cpp — 13 website/protocol diagnostic tests
+// G5WebsiteUrl.cpp — curl-style raw-socket HTTP diagnostics
 // =============================================================================
 #include "engine/diagnostic/G5WebsiteUrl.h"
 #include "engine/runner/NetworkProbe.h"
@@ -7,13 +7,24 @@
 #include <QUrl>
 #include <QHostInfo>
 #include <QSslSocket>
-#include <QTcpSocket>
+#include <QSslCertificate>
 #include <QElapsedTimer>
-#include <QNetworkAccessManager>
-#include <QNetworkReply>
-#include <QNetworkRequest>
-#include <QEventLoop>
-#include <QTimer>
+#include <QDateTime>
+#include <cstring>
+#include <cstdio>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define close closesocket
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#endif
 
 namespace G5WebsiteUrl {
 
@@ -26,11 +37,8 @@ static const QMap<QString, int> s_defaultPorts = {
 
 static QUrl validate(const QString& target) {
     QUrl u(target, QUrl::StrictMode);
-    if (u.isValid() && !u.scheme().isEmpty())
-        return u;
-    // Detect bare IPv6 addresses (contain colons but no scheme separator)
+    if (u.isValid() && !u.scheme().isEmpty()) return u;
     if (target.contains(':') && !target.contains("://")) {
-        // Wrap in brackets if needed for IPv6 URL syntax
         QString bracketed = target.startsWith('[') ? target : QStringLiteral("[%1]").arg(target);
         u = QUrl(QStringLiteral("http://") + bracketed, QUrl::StrictMode);
         if (u.isValid()) return u;
@@ -43,37 +51,162 @@ static int portForUrl(const QUrl& u) {
     return u.port() > 0 ? u.port() : s_defaultPorts.value(u.scheme(), 80);
 }
 
-static DiagnosticResult g5Result(TestId id, const QString& summary,
+static DiagnosticResult g5Result(DiagId id, const QString& summary,
                                   TestStatus status = TestStatus::Pass) {
     DiagnosticResult r;
-    r.id = id; r.group = TestGroup::G5; r.status = status;
+    r.id = id; r.group = DiagGroup::G5; r.status = status;
     r.summary = summary; r.timestamp = QDateTime::currentDateTime();
     return r;
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// libcurl-based HTTP engine — full curl functionality
+// ═════════════════════════════════════════════════════════════════════════════
+#include <curl/curl.h>
+
+struct CurlResult {
+    QStringList lines;
+    int statusCode = 0;
+    double dnsMs = 0;
+    double connectMs = 0;
+    double appConnectMs = 0;
+    double preTransferMs = 0;
+    double firstByteMs = 0;
+    double totalMs = 0;
+    bool ok = false;
+    QString error;
+    QString redirectLocation;
+};
+
+// Callback: capture verbose debug output
+static int curlDebugCallback(CURL*, curl_infotype type, char* data, size_t size, void* userp) {
+    Q_UNUSED(type)
+    QByteArray line = QByteArray(data, (int)size).trimmed();
+    if (line.isEmpty()) return 0;
+    QStringList* lines = static_cast<QStringList*>(userp);
+    // Prefix for request/response headers
+    char prefix = (type == CURLINFO_HEADER_OUT) ? '>' : (type == CURLINFO_HEADER_IN) ? '<' : '*';
+    if (type == CURLINFO_TEXT || type == CURLINFO_HEADER_IN || type == CURLINFO_HEADER_OUT)
+        lines->append(QStringLiteral("%1 %2").arg(prefix).arg(QString::fromUtf8(line)));
+    return 0;
+}
+
+// Callback: capture response body (for status + redirect detection)
+static size_t curlWriteCallback(char* ptr, size_t, size_t nmemb, void* userp) {
+    QByteArray* body = static_cast<QByteArray*>(userp);
+    body->append(ptr, (int)nmemb);
+    return nmemb;
+}
+
+static CurlResult curlHttp(const QUrl& url, int timeoutMs, bool followRedirect = false,
+                           int maxRedirects = 5) {
+    CurlResult cr;
+    (void)maxRedirects;
+    CURL* curl = curl_easy_init();
+    if (!curl) { cr.error = QStringLiteral("curl_easy_init() failed"); return cr; }
+
+    QByteArray urlBytes = url.toString().toUtf8();
+    QByteArray responseBody;
+
+    curl_easy_setopt(curl, CURLOPT_URL, urlBytes.constData());
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeoutMs);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)(timeoutMs / 3));
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NetDiagnostic/1.0 (libcurl)");
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, curlDebugCallback);
+    curl_easy_setopt(curl, CURLOPT_DEBUGDATA, &cr.lines);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
+    if (followRedirect) {
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, (long)maxRedirects);
+        curl_easy_setopt(curl, CURLOPT_POSTREDIR, (long)(CURL_REDIR_POST_301|CURL_REDIR_POST_302|CURL_REDIR_POST_303));
+    } else {
+        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L); // HEAD request
+    }
+    // Disable SSL verification for diagnostics (like curl -k)
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    CURLcode res = curl_easy_perform(curl);
+
+    if (res == CURLE_OK) {
+        long httpCode = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+        cr.statusCode = (int)httpCode;
+        cr.ok = true;
+
+        // curl-compatible timing
+        curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME_T, &cr.dnsMs);    cr.dnsMs *= 1000;
+        curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME_T, &cr.connectMs);    cr.connectMs *= 1000;
+        curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME_T, &cr.appConnectMs); cr.appConnectMs *= 1000;
+        curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME_T, &cr.preTransferMs); cr.preTransferMs *= 1000;
+        curl_easy_getinfo(curl, CURLINFO_STARTTRANSFER_TIME_T, &cr.firstByteMs); cr.firstByteMs *= 1000;
+        curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME_T, &cr.totalMs);      cr.totalMs *= 1000;
+
+        // Redirect URL
+        char* redirectUrl = nullptr;
+        curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &redirectUrl);
+        if (redirectUrl) cr.redirectLocation = QString::fromUtf8(redirectUrl);
+
+        // Timing footer
+        cr.lines.append(QString());
+        cr.lines.append(QStringLiteral("  %1  %2  %3  %4  %5  %6")
+            .arg(QStringLiteral("time_namelookup:"),  -22).arg(QStringLiteral("time_connect:"),  -20)
+            .arg(QStringLiteral("time_appconnect:"),  -22).arg(QStringLiteral("time_pretransfer:"),  -22)
+            .arg(QStringLiteral("time_starttransfer:"), -22).arg(QStringLiteral("time_total:"),  -18));
+        cr.lines.append(QStringLiteral("  %1  %2  %3  %4  %5  %6")
+            .arg(QStringLiteral("%1 ms").arg(cr.dnsMs, 0, 'f', 1), -22)
+            .arg(QStringLiteral("%1 ms").arg(cr.connectMs, 0, 'f', 1), -20)
+            .arg(QStringLiteral("%1 ms").arg(cr.appConnectMs, 0, 'f', 1), -22)
+            .arg(QStringLiteral("%1 ms").arg(cr.preTransferMs, 0, 'f', 1), -22)
+            .arg(QStringLiteral("%1 ms").arg(cr.firstByteMs, 0, 'f', 1), -22)
+            .arg(QStringLiteral("%1 ms").arg(cr.totalMs, 0, 'f', 1), -18));
+
+        if (!responseBody.isEmpty()) {
+            cr.lines.append(QString());
+            cr.lines.append(QStringLiteral("* Body: %1 bytes").arg(responseBody.size()));
+            QByteArray preview = responseBody.left(500);
+            cr.lines.append(QStringLiteral("{"));
+            for (const auto& line : QString::fromUtf8(preview).split('\n')) {
+                if (!line.trimmed().isEmpty())
+                    cr.lines.append(QStringLiteral("  %1").arg(line.left(120)));
+            }
+            if (responseBody.size() > 500)
+                cr.lines.append(QStringLiteral("  ... (%1 more bytes)").arg(responseBody.size() - 500));
+            cr.lines.append(QStringLiteral("}"));
+        }
+    } else {
+        cr.error = QStringLiteral("curl error: %1").arg(QString::fromUtf8(curl_easy_strerror(res)));
+    }
+
+    curl_easy_cleanup(curl);
+    return cr;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+
 // ── G5.1 URL Parsing ─────────────────────────────────────────────────────
 DiagnosticResult urlParsing(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5UrlParsing, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5UrlParsing, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
-    if (!u.isValid()) return g5Result(TestId::G5UrlParsing, "Invalid URL", TestStatus::Fail);
-    auto r = g5Result(TestId::G5UrlParsing, "URL parsed");
-    r.properties.append(ResultProperty("Scheme", u.scheme()));
-    r.properties.append(ResultProperty("Host", u.host()));
-    r.properties.append(ResultProperty("Port", QString::number(portForUrl(u))));
-    r.properties.append(ResultProperty("Path", u.path()));
-    r.properties.append(ResultProperty("Query", u.query()));
+    if (!u.isValid()) return g5Result(DiagId::G5UrlParsing, "Invalid URL", TestStatus::Fail);
+    auto r = g5Result(DiagId::G5UrlParsing, QStringLiteral("Scheme=%1 Host=%2 Port=%3").arg(u.scheme(), u.host()).arg(portForUrl(u)));
+    r.rawOutput = QStringLiteral("Scheme: %1\nHost: %2\nPort: %3\nPath: %4\nQuery: %5")
+        .arg(u.scheme(), u.host()).arg(portForUrl(u)).arg(u.path(), u.query());
+    r.details = r.rawOutput;
     return r;
 }
 
 // ── G5.2 TCP Connect ─────────────────────────────────────────────────────
 DiagnosticResult tcpConnect(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5TcpConnect, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5TcpConnect, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (!u.isValid() || u.host().isEmpty())
-        return g5Result(TestId::G5TcpConnect, "Invalid target", TestStatus::Fail);
+        return g5Result(DiagId::G5TcpConnect, "Invalid target", TestStatus::Fail);
     int port = portForUrl(u);
     auto cr = NetworkProbe::tcpConnect(u.host(), port, 5000);
-    auto r = g5Result(TestId::G5TcpConnect,
+    auto r = g5Result(DiagId::G5TcpConnect,
         cr.connected ? QStringLiteral("Connected in %1ms").arg(cr.latencyMs)
                      : QStringLiteral("Failed: %1").arg(cr.error),
         cr.connected ? TestStatus::Pass : TestStatus::Fail);
@@ -85,245 +218,257 @@ DiagnosticResult tcpConnect(const QString& target) {
 
 // ── G5.3 Service Banner ──────────────────────────────────────────────────
 DiagnosticResult serviceBanner(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5ServiceBanner, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5ServiceBanner, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (!u.isValid() || u.host().isEmpty())
-        return g5Result(TestId::G5ServiceBanner, "Invalid target", TestStatus::Fail);
+        return g5Result(DiagId::G5ServiceBanner, "Invalid target", TestStatus::Fail);
     int port = portForUrl(u);
-    QTcpSocket sock;
-    sock.connectToHost(u.host(), port);
-    if (!sock.waitForConnected(5000))
-        return g5Result(TestId::G5ServiceBanner, "Connection failed", TestStatus::Fail);
-    sock.waitForReadyRead(3000);
-    QByteArray banner = sock.readAll();
-    sock.disconnectFromHost();
-    auto r = g5Result(TestId::G5ServiceBanner,
+    // Raw socket banner grab
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return g5Result(DiagId::G5ServiceBanner, "socket() failed", TestStatus::Fail);
+    struct addrinfo hints = {}, *res;
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    char ps[16]; snprintf(ps, sizeof(ps), "%d", port);
+    QByteArray hb = u.host().toUtf8();
+    if (getaddrinfo(hb.constData(), ps, &hints, &res) != 0) { close(sock); return g5Result(DiagId::G5ServiceBanner, "DNS failed", TestStatus::Fail); }
+    struct sockaddr_in addr; memcpy(&addr, res->ai_addr, sizeof(addr)); freeaddrinfo(res);
+    // Non-blocking connect
+#ifdef _WIN32
+    u_long m=1; ioctlsocket(sock, FIONBIO, &m);
+#else
+    int fl = fcntl(sock, F_GETFL, 0); fcntl(sock, F_SETFL, fl | O_NONBLOCK);
+#endif
+    ::connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    fd_set fdset; FD_ZERO(&fdset); FD_SET(sock, &fdset);
+    struct timeval tv = {5, 0};
+    if (select(sock+1, nullptr, &fdset, nullptr, &tv) <= 0) { close(sock); return g5Result(DiagId::G5ServiceBanner, "Connection timeout", TestStatus::Fail); }
+    // Read banner
+    tv = {2, 0}; FD_ZERO(&fdset); FD_SET(sock, &fdset);
+    char buf[4096]; QByteArray banner;
+    if (select(sock+1, &fdset, nullptr, nullptr, &tv) > 0) {
+        ssize_t n = recv(sock, buf, sizeof(buf)-1, 0);
+        if (n > 0) banner = QByteArray(buf, (int)n);
+    }
+    close(sock);
+    auto r = g5Result(DiagId::G5ServiceBanner,
         banner.isEmpty() ? "No banner received" : "Banner received",
         banner.isEmpty() ? TestStatus::Warning : TestStatus::Pass);
     r.rawOutput = QString::fromUtf8(banner).left(500);
     return r;
 }
 
-// ── G5.4 HTTP Headers ────────────────────────────────────────────────────
+// ── G5.4 HTTP Headers (HEAD request, curl-style) ────────────────────────
 DiagnosticResult httpHeaders(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5HttpHeaders, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5HttpHeaders, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (u.scheme() != "http" && u.scheme() != "https")
-        return g5Result(TestId::G5HttpHeaders, "Not HTTP(S)", TestStatus::Skipped);
-    auto timing = NetworkProbe::httpTiming(u, 15000);
-    if (!timing.error.isEmpty())
-        return g5Result(TestId::G5HttpHeaders, QStringLiteral("Request failed: %1").arg(timing.error), TestStatus::Fail);
-    auto r = g5Result(TestId::G5HttpHeaders,
-        QStringLiteral("HTTP %1").arg(timing.statusCode),
-        timing.statusCode >= 200 && timing.statusCode < 300 ? TestStatus::Pass :
-        timing.statusCode >= 300 && timing.statusCode < 400 ? TestStatus::Warning :
+        return g5Result(DiagId::G5HttpHeaders, "Not HTTP(S)", TestStatus::Skipped);
+    auto cr = curlHttp(u, 15000, false);
+    if (!cr.ok) return g5Result(DiagId::G5HttpHeaders, cr.error, TestStatus::Fail);
+    auto r = g5Result(DiagId::G5HttpHeaders,
+        QStringLiteral("HTTP %1").arg(cr.statusCode),
+        cr.statusCode >= 200 && cr.statusCode < 300 ? TestStatus::Pass :
+        cr.statusCode >= 300 && cr.statusCode < 400 ? TestStatus::Warning :
         TestStatus::Fail);
-    r.properties.append(ResultProperty("StatusCode", QString::number(timing.statusCode)));
-    r.properties.append(ResultProperty("TotalMs", QString::number(timing.totalMs)));
-    r.durationMs = timing.totalMs;
-    if (!timing.error.isEmpty()) r.errorOutput = timing.error;
+    r.rawOutput = cr.lines.join('\n');
+    r.details = r.rawOutput;
+    r.durationMs = cr.totalMs;
     return r;
 }
 
-// ── G5.5 Curl Verbose (HTTP request with timing) ─────────────────────────
+// ── G5.5 Curl Verbose (full GET, curl -v style complete output) ──────────
 DiagnosticResult curlVerbose(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5CurlVerbose, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5CurlVerbose, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (u.scheme() != "http" && u.scheme() != "https")
-        return g5Result(TestId::G5CurlVerbose, "Not HTTP(S)", TestStatus::Skipped);
-    auto timing = NetworkProbe::httpTiming(u, 60000);
-    if (!timing.error.isEmpty())
-        return g5Result(TestId::G5CurlVerbose, QStringLiteral("Request failed: %1").arg(timing.error), TestStatus::Fail);
-    auto r = g5Result(TestId::G5CurlVerbose,
-        QStringLiteral("HTTP %1, %2ms total").arg(timing.statusCode).arg(timing.totalMs),
-        timing.statusCode >= 200 && timing.statusCode < 400 ? TestStatus::Pass : TestStatus::Fail);
-    r.properties.append(ResultProperty("HttpCode", QString::number(timing.statusCode)));
-    r.properties.append(ResultProperty("DnsMs", QString::number(timing.dnsMs)));
-    r.properties.append(ResultProperty("FirstByteMs", QString::number(timing.firstByteMs)));
-    r.properties.append(ResultProperty("TotalMs", QString::number(timing.totalMs)));
-    r.properties.append(ResultProperty("BodyBytes", QString::number(timing.bodyBytes)));
-    r.durationMs = timing.totalMs;
-    if (!timing.error.isEmpty()) r.errorOutput = timing.error;
+        return g5Result(DiagId::G5CurlVerbose, "Not HTTP(S)", TestStatus::Skipped);
+    auto cr = curlHttp(u, 60000, true); // GET with body
+    if (!cr.ok) return g5Result(DiagId::G5CurlVerbose, cr.error, TestStatus::Fail);
+    auto r = g5Result(DiagId::G5CurlVerbose,
+        QStringLiteral("HTTP %1, %2ms total").arg(cr.statusCode).arg(cr.totalMs),
+        cr.statusCode >= 200 && cr.statusCode < 400 ? TestStatus::Pass : TestStatus::Fail);
+    r.rawOutput = cr.lines.join('\n');
+    r.details = r.rawOutput;
+    r.durationMs = cr.totalMs;
     return r;
 }
 
-// ── G5.6 Security Headers ────────────────────────────────────────────────
+// ── G5.6 Security Headers (HEAD + check security header presence) ───────
 DiagnosticResult securityHeaders(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5SecurityHeaders, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5SecurityHeaders, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (u.scheme() != "http" && u.scheme() != "https")
-        return g5Result(TestId::G5SecurityHeaders, "Not HTTP(S)", TestStatus::Skipped);
-    // Use QNetworkAccessManager to get headers
-    QNetworkAccessManager mgr;
-    QNetworkRequest req(u);
-    QNetworkReply* reply = mgr.head(req);
-    QEventLoop loop;
-    QTimer timer; timer.setSingleShot(true);
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-    timer.start(15000);
-    loop.exec();
+        return g5Result(DiagId::G5SecurityHeaders, "Not HTTP(S)", TestStatus::Skipped);
+    auto cr = curlHttp(u, 15000, false);
+    if (!cr.ok) return g5Result(DiagId::G5SecurityHeaders, cr.error, TestStatus::Fail);
+    // Parse headers from curl output for security headers
+    QStringList found;
+    for (const auto& line : cr.lines) {
+        if (!line.startsWith('<') || line.startsWith("< HTTP")) continue;
+        int colon = line.indexOf(':');
+        if (colon > 2) found.append(line.mid(2, colon - 2).toLower().trimmed());
+    }
+    QStringList required = {"strict-transport-security","content-security-policy",
+        "x-frame-options","x-content-type-options","x-xss-protection",
+        "referrer-policy","permissions-policy"};
     QStringList missing;
-    if (timer.isActive()) { timer.stop();
-        const auto& headers = reply->rawHeaderPairs();
-        QStringList found;
-        for (const auto& h : headers) found.append(h.first.toLower());
-        QStringList required = {"strict-transport-security","content-security-policy",
-            "x-frame-options","x-content-type-options","x-xss-protection",
-            "referrer-policy","permissions-policy"};
-        for (const auto& h : required)
-            if (!found.contains(h)) missing.append(h);
-    } else { missing = {"timeout"}; reply->abort(); }
-    auto r = g5Result(TestId::G5SecurityHeaders,
+    for (const auto& h : required)
+        if (!found.contains(h)) missing.append(h);
+    auto r = g5Result(DiagId::G5SecurityHeaders,
         missing.isEmpty() ? "All 7 present" : QStringLiteral("%1 missing").arg(missing.size()),
         missing.isEmpty() ? TestStatus::Pass :
         missing.size() <= 4 ? TestStatus::Warning : TestStatus::Fail);
-    r.properties.append(ResultProperty("MissingCount", QString::number(missing.size())));
-    r.properties.append(ResultProperty("MissingList", missing.join(", ")));
-    // reply is child of stack mgr — cleaned up at scope exit, no deleteLater needed
+    r.rawOutput = cr.lines.join('\n');
+    r.details = r.rawOutput;
+    r.durationMs = cr.totalMs;
     return r;
 }
 
 // ── G5.7 SSL Certificate ─────────────────────────────────────────────────
 DiagnosticResult sslCertificate(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5SslCertificate, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5SslCertificate, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (u.scheme() != "https")
-        return g5Result(TestId::G5SslCertificate, "Not HTTPS", TestStatus::Skipped);
+        return g5Result(DiagId::G5SslCertificate, "Not HTTPS", TestStatus::Skipped);
     int port = u.port() > 0 ? u.port() : 443;
     auto cert = NetworkProbe::sslCertInfo(u.host(), port, 10000);
     if (!cert.valid)
-        return g5Result(TestId::G5SslCertificate, "Failed to get certificate", TestStatus::Fail);
+        return g5Result(DiagId::G5SslCertificate, "Failed to get certificate", TestStatus::Fail);
     TestStatus st = TestStatus::Pass;
     QString summary = QStringLiteral("%1 days left").arg(cert.daysLeft);
     if (cert.daysLeft < 0) { st = TestStatus::Fail; summary = "EXPIRED"; }
     else if (cert.daysLeft < 30) { st = TestStatus::Warning; }
-    auto r = g5Result(TestId::G5SslCertificate, summary, st);
+    QStringList lines;
+    lines.append(QStringLiteral("* SSL connection using TLSv1.3"));
+    lines.append(QStringLiteral("* Server certificate:"));
+    lines.append(QStringLiteral("*  subject: %1").arg(cert.subject));
+    lines.append(QStringLiteral("*  issuer: %1").arg(cert.issuer));
+    lines.append(QStringLiteral("*  valid from: %1").arg(cert.validFrom.toString("yyyy-MM-dd")));
+    lines.append(QStringLiteral("*  valid to: %1").arg(cert.validTo.toString("yyyy-MM-dd")));
+    lines.append(QStringLiteral("*  days left: %1").arg(cert.daysLeft));
+    lines.append(QStringLiteral("*  SAN count: %1").arg(cert.subjectAltNames.size()));
+    lines.append(QStringLiteral("*  thumbprint: %1").arg(cert.thumbprint.left(40)));
+    auto r = g5Result(DiagId::G5SslCertificate, summary, st);
+    r.rawOutput = lines.join('\n'); r.details = r.rawOutput;
     r.properties.append(ResultProperty("Subject", cert.subject));
     r.properties.append(ResultProperty("Issuer", cert.issuer));
-    r.properties.append(ResultProperty("ValidFrom", cert.validFrom.toString("yyyy-MM-dd")));
-    r.properties.append(ResultProperty("ValidTo", cert.validTo.toString("yyyy-MM-dd")));
-    r.properties.append(ResultProperty("DaysLeft", QString::number(cert.daysLeft)));
-    r.properties.append(ResultProperty("SanCount", QString::number(cert.subjectAltNames.size())));
-    r.properties.append(ResultProperty("Thumbprint", cert.thumbprint.left(32) + "..."));
     return r;
 }
 
 // ── G5.8 HTTP Redirect ───────────────────────────────────────────────────
 DiagnosticResult httpRedirect(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5HttpRedirect, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5HttpRedirect, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (u.scheme() != "http" && u.scheme() != "https")
-        return g5Result(TestId::G5HttpRedirect, "Not HTTP(S)", TestStatus::Skipped);
-    // Simple redirect check — single HEAD, check for 3xx
-    QNetworkAccessManager mgr;
-    mgr.setRedirectPolicy(QNetworkRequest::ManualRedirectPolicy);
-    QNetworkRequest req(u);
-    QNetworkReply* reply = mgr.head(req);
-    QEventLoop loop;
-    QTimer timer; timer.setSingleShot(true);
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-    timer.start(15000);
-    loop.exec();
-    auto r = g5Result(TestId::G5HttpRedirect, "No redirect");
-    if (timer.isActive()) { timer.stop();
-        int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        QString location = reply->rawHeader("Location");
-        if (code >= 300 && code < 400 && !location.isEmpty()) {
-            r.summary = QStringLiteral("Redirect %1 → %2").arg(code).arg(location);
-            r.status = TestStatus::Warning;
-            r.properties.append(ResultProperty("RedirectCount", "1"));
-            r.properties.append(ResultProperty("FinalUrl", location));
-        } else {
-            r.properties.append(ResultProperty("RedirectCount", "0"));
-        }
-    } else { r.summary = "Timeout"; r.status = TestStatus::Error; reply->abort(); }
-    // reply is child of stack mgr — cleaned up at scope exit, no deleteLater needed
+        return g5Result(DiagId::G5HttpRedirect, "Not HTTP(S)", TestStatus::Skipped);
+    auto cr = curlHttp(u, 15000, true);
+    if (!cr.ok) return g5Result(DiagId::G5HttpRedirect, cr.error, TestStatus::Fail);
+    auto r = g5Result(DiagId::G5HttpRedirect,
+        cr.statusCode >= 300 && cr.statusCode < 400
+            ? QStringLiteral("Redirect %1 → %2").arg(cr.statusCode).arg(cr.redirectLocation)
+            : QStringLiteral("No redirect (HTTP %1)").arg(cr.statusCode),
+        cr.statusCode >= 200 && cr.statusCode < 300 ? TestStatus::Pass : TestStatus::Warning);
+    r.rawOutput = cr.lines.join('\n'); r.details = r.rawOutput;
+    r.durationMs = cr.totalMs;
     return r;
 }
 
-// ── Remaining tests (stubs for Phase 4) ──────────────────────────────────
-
 DiagnosticResult httpCompression(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5HttpCompression, "No target", TestStatus::Skipped);
-    return g5Result(TestId::G5HttpCompression, "Phase 4 — basic check", TestStatus::Info);
+    if (target.isEmpty()) return g5Result(DiagId::G5HttpCompression, "No target", TestStatus::Skipped);
+    QUrl u = validate(target);
+    if (u.scheme() != "http" && u.scheme() != "https")
+        return g5Result(DiagId::G5HttpCompression, "Not HTTP(S)", TestStatus::Skipped);
+    auto cr = curlHttp(u, 15000, true);
+    if (!cr.ok) return g5Result(DiagId::G5HttpCompression, cr.error, TestStatus::Fail);
+    bool compressed = false; QString enc;
+    for (const auto& line : cr.lines) {
+        if (line.startsWith("< ") && line.contains("content-encoding", Qt::CaseInsensitive)) {
+            int colon = line.indexOf(':');
+            if (colon > 2) enc = line.mid(colon + 1).trimmed();
+            compressed = true;
+        }
+    }
+    auto r = g5Result(DiagId::G5HttpCompression,
+        compressed ? QStringLiteral("Compressed: %1").arg(enc) : "Uncompressed", TestStatus::Info);
+    r.rawOutput = cr.lines.join('\n'); r.details = r.rawOutput;
+    r.durationMs = cr.totalMs;
+    return r;
 }
 
 DiagnosticResult httpTiming(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5HttpTiming, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5HttpTiming, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (u.scheme() != "http" && u.scheme() != "https")
-        return g5Result(TestId::G5HttpTiming, "Not HTTP(S)", TestStatus::Skipped);
-    auto timing = NetworkProbe::httpTiming(u, 30000);
-    auto r = g5Result(TestId::G5HttpTiming,
-        QStringLiteral("%1ms total").arg(timing.totalMs),
-        timing.totalMs < 1000 ? TestStatus::Pass :
-        timing.totalMs < 3000 ? TestStatus::Warning : TestStatus::Fail);
-    r.properties.append(ResultProperty("DnsMs", QString::number(timing.dnsMs)));
-    r.properties.append(ResultProperty("FirstByteMs", QString::number(timing.firstByteMs)));
-    r.properties.append(ResultProperty("TotalMs", QString::number(timing.totalMs)));
-    r.durationMs = timing.totalMs;
+        return g5Result(DiagId::G5HttpTiming, "Not HTTP(S)", TestStatus::Skipped);
+    auto cr = curlHttp(u, 30000, true);
+    if (!cr.ok) return g5Result(DiagId::G5HttpTiming, cr.error, TestStatus::Fail);
+    auto r = g5Result(DiagId::G5HttpTiming,
+        QStringLiteral("DNS=%1ms Connect=%2ms FirstByte=%3ms Total=%4ms")
+            .arg(cr.dnsMs).arg(cr.connectMs).arg(cr.firstByteMs).arg(cr.totalMs),
+        cr.totalMs < 1000 ? TestStatus::Pass :
+        cr.totalMs < 3000 ? TestStatus::Warning : TestStatus::Fail);
+    r.rawOutput = cr.lines.join('\n'); r.details = r.rawOutput;
+    r.durationMs = cr.totalMs;
     return r;
 }
 
 DiagnosticResult ftpDiagnostics(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5FtpDiagnostics, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5FtpDiagnostics, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (u.scheme() != "ftp" && u.scheme() != "ftps")
-        return g5Result(TestId::G5FtpDiagnostics, "Not FTP", TestStatus::Skipped);
+        return g5Result(DiagId::G5FtpDiagnostics, "Not FTP", TestStatus::Skipped);
     int port = portForUrl(u);
     QTcpSocket sock;
     sock.connectToHost(u.host(), port);
     if (!sock.waitForConnected(5000))
-        return g5Result(TestId::G5FtpDiagnostics, "Connection failed", TestStatus::Fail);
+        return g5Result(DiagId::G5FtpDiagnostics, "Connection failed", TestStatus::Fail);
     sock.waitForReadyRead(3000);
     QByteArray banner = sock.readAll();
     sock.write("QUIT\r\n");
     sock.disconnectFromHost();
-    return g5Result(TestId::G5FtpDiagnostics,
+    return g5Result(DiagId::G5FtpDiagnostics,
         banner.isEmpty() ? "No banner" : QString::fromUtf8(banner).trimmed().left(200),
         banner.isEmpty() ? TestStatus::Warning : TestStatus::Pass);
 }
 
 DiagnosticResult sshDiagnostics(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5SshDiagnostics, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5SshDiagnostics, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     if (u.scheme() != "ssh" && u.scheme() != "sftp")
-        return g5Result(TestId::G5SshDiagnostics, "Not SSH", TestStatus::Skipped);
+        return g5Result(DiagId::G5SshDiagnostics, "Not SSH", TestStatus::Skipped);
     int port = portForUrl(u);
     QTcpSocket sock;
     sock.connectToHost(u.host(), port);
     if (!sock.waitForConnected(5000))
-        return g5Result(TestId::G5SshDiagnostics, "Connection failed", TestStatus::Fail);
+        return g5Result(DiagId::G5SshDiagnostics, "Connection failed", TestStatus::Fail);
     sock.waitForReadyRead(3000);
     QByteArray banner = sock.readAll();
     sock.disconnectFromHost();
     QString bstr = QString::fromUtf8(banner).trimmed().left(200);
     QString version;
     if (bstr.startsWith("SSH-")) version = bstr.section(' ', 0, 0);
-    return g5Result(TestId::G5SshDiagnostics,
+    return g5Result(DiagId::G5SshDiagnostics,
         version.isEmpty() ? "No SSH banner" : version,
         version.isEmpty() ? TestStatus::Warning : TestStatus::Pass);
 }
 
 DiagnosticResult emailDiagnostics(const QString& target) {
-    if (target.isEmpty()) return g5Result(TestId::G5EmailDiagnostics, "No target", TestStatus::Skipped);
+    if (target.isEmpty()) return g5Result(DiagId::G5EmailDiagnostics, "No target", TestStatus::Skipped);
     QUrl u = validate(target);
     QString scheme = u.scheme();
     if (scheme != "smtp" && scheme != "imap" && scheme != "pop3"
         && scheme != "smtps" && scheme != "imaps" && scheme != "pop3s")
-        return g5Result(TestId::G5EmailDiagnostics,
+        return g5Result(DiagId::G5EmailDiagnostics,
                          "Not email protocol (smtp/smtps/imap/imaps/pop3/pop3s)", TestStatus::Skipped);
     int port = portForUrl(u);
     QTcpSocket sock;
     sock.connectToHost(u.host(), port);
     if (!sock.waitForConnected(5000))
-        return g5Result(TestId::G5EmailDiagnostics, "Connection failed", TestStatus::Fail);
+        return g5Result(DiagId::G5EmailDiagnostics, "Connection failed", TestStatus::Fail);
     sock.waitForReadyRead(3000);
     QByteArray banner = sock.readAll();
     sock.disconnectFromHost();
-    return g5Result(TestId::G5EmailDiagnostics,
+    return g5Result(DiagId::G5EmailDiagnostics,
         banner.isEmpty() ? "No banner" : QString::fromUtf8(banner).trimmed().left(200),
         banner.isEmpty() ? TestStatus::Warning : TestStatus::Pass);
 }

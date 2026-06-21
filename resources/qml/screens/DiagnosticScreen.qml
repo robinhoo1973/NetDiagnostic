@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import "../widgets"
+import "../theme"
 
 // ── Flutter DiagnosticMainScreen 1:1 ───────────────────────────────────
 Item {
@@ -9,25 +10,95 @@ Item {
     objectName: "diagnostic"
     readonly property bool wide: width >= 600
 
-    // ── Polled state (C++ signals are unreliable on ARM64) ────────────
+    // ── Version-based state sync (single Timer replaces 4 polling timers) ──
+    property int _cachedGen: -1
     property int _runStatus: 0
     property int _totalCompleted: 0
     property int _totalTests: 0
-    property int _checkboxVersion: 0
+    property bool _runActive: false       // true while runStatus === Running
+
+    // ── Config snapshot — frozen at Run click, released on Complete/Cancel/Error ──
+    property string _snapIconName: "circle"
+    property color _snapIconColor: Qt.alpha(Theme.textSecondary, 0.4)
+    property string _snapTargetError: ""
+    property bool _snapG0chk: true
+    property bool _snapG1chk: true
+    property bool _snapG2chk: true
+    property bool _snapG3en: false
+    property bool _snapG3chk: false
+    property bool _snapG4en: false
+    property bool _snapG4chk: false
+    // Incremented by takeSnapshot so SidebarContent can detect changes
+    property int _snapVersion: 0
+
+    function takeSnapshot() {
+        _snapG0chk = appState.isGroupAllEnabled(0) || appState.isGroupAnyEnabled(0)
+        _snapG1chk = appState.isGroupAllEnabled(1) || appState.isGroupAnyEnabled(1)
+        _snapG2chk = appState.isGroupAllEnabled(2) || appState.isGroupAnyEnabled(2)
+        _snapG3chk = appState.isGroupAllEnabled(3) || appState.isGroupAnyEnabled(3)
+        _snapG4chk = appState.isGroupAllEnabled(4) || appState.isGroupAnyEnabled(4)
+        _snapG3en  = !appState.isTargetEmpty()
+        _snapG4en  = appState.isTargetUrl()
+
+        var err = appState.targetValidationError()
+        if (err !== "") {
+            _snapIconName = "error"
+            _snapIconColor = Theme.failRed
+        } else if (appState.isTargetEmpty()) {
+            _snapIconName = "circle"
+            _snapIconColor = Qt.alpha(Theme.textSecondary, 0.4)
+        } else if (appState.isTargetUrl()) {
+            _snapIconName = "globe"
+            _snapIconColor = Theme.accentBlue
+        } else {
+            _snapIconName = "target"
+            _snapIconColor = Theme.passGreen
+        }
+        _snapTargetError = err
+        _snapVersion++
+    }
+
+    function syncState() {
+        var v = appState.stateVersion
+        if (v === _cachedGen) return
+        _cachedGen = v
+
+        var newStatus = appState.runStatus
+
+        // ── Detect run lifecycle transitions ──
+        if (newStatus === 1 && !_runActive) {
+            // Run started: take snapshot, freeze config
+            takeSnapshot()
+            _runActive = true
+        } else if (newStatus !== 1 && _runActive) {
+            // Run ended (Completed/Cancelled/Error): release snapshot, full sync
+            _runActive = false
+        }
+
+        // Always sync progress (changes during run)
+        _runStatus = newStatus
+        _totalCompleted = appState.totalCompleted
+        _totalTests = appState.totalTests
+
+        // Full config sync only when not in active run
+        if (!_runActive) {
+            takeSnapshot()
+        }
+    }
+
+    // Init immediately — triggers first takeSnapshot() before 200 ms Timer fires
+    Component.onCompleted: takeSnapshot()
+
+    // Single polling Timer — replaces 4 independent timers
     Timer {
         interval: 200; running: true; repeat: true
-        onTriggered: {
-            _runStatus = appState.runStatus
-            _totalCompleted = appState.totalCompleted
-            _totalTests = appState.totalTests
-            _checkboxVersion++
-        }
+        onTriggered: syncState()
     }
 
     // Filter groups: only show those with enabled tests or results
     property var currentDetail: ({})
     property var visibleGroups: {
-        var _force = _totalCompleted + _runStatus
+        var _force = _totalCompleted + _runStatus + (_runActive ? 1 : 0)
         var g = []
         for (var i = 0; i < appState.groupLabels.length; i++) {
             var s = appState.groupStats(i)
@@ -44,7 +115,14 @@ Item {
         Rectangle {
             Layout.preferredWidth: 260; Layout.fillHeight: true
             color: Theme.bgSidebar; clip: true
-            SidebarContent { anchors.fill: parent; compact: false }
+            Flickable {
+                anchors.fill: parent
+                contentWidth: width; contentHeight: sidebarColWide.implicitHeight
+                boundsBehavior: Flickable.StopAtBounds
+                ColumnLayout { id: sidebarColWide; width: parent.width
+                    SidebarContent { width: parent.width; compact: false }
+                }
+            }
         }
         Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; color: "#3A3A5A" }
         ContentArea { Layout.fillWidth: true; Layout.fillHeight: true }
@@ -74,7 +152,35 @@ Item {
     // ═══════════════════ SIDEBAR ═══════════════════
     component SidebarContent: ColumnLayout {
         property bool compact: false
+        property int _cachedSnapVer: -1
         spacing: 0
+
+        // ── CheckBox → page snapshot sync (inside component scope where cb0–cb4 exist) ──
+        function syncCheckboxes() {
+            if (!cb0 || !cb1 || !cb2 || !cb3 || !cb4) return
+            cb0.checked = page._snapG0chk
+            cb1.checked = page._snapG1chk
+            cb2.checked = page._snapG2chk
+            cb3.checked = page._snapG3chk
+            cb4.checked = page._snapG4chk
+            cb3.enabled = page._snapG3en && !page._runActive
+            cb4.enabled = page._snapG4en && !page._runActive
+        }
+
+        // Poll page._snapVersion — page.takeSnapshot() bumps it on every config change.
+        // Timer lives inside SidebarContent so it can reach cb0…cb4 directly.
+        Timer {
+            interval: 200; running: true; repeat: true
+            onTriggered: {
+                if (page._snapVersion !== _cachedSnapVer) {
+                    _cachedSnapVer = page._snapVersion
+                    syncCheckboxes()
+                }
+            }
+        }
+
+        // Immediate init on component creation
+        Component.onCompleted: syncCheckboxes()
 
         // Header — matches Flutter Container(padding h16 v14, border bottom #3A3A5A)
         Rectangle {
@@ -85,7 +191,7 @@ Item {
                 anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
                 AppIcon { name: "wifi"; size: 20; color: Theme.cyan }
                 Item { width: 10 }
-                Label { text: "NetAnalysis"; font.family: "JetBrains Mono"; font.pixelSize: 16; font.weight: Font.Bold; color: Theme.textPrimary }
+                Label { text: "NetAnalysis"; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 16; font.weight: Font.Bold; color: Theme.textPrimary }
             }
         }
 
@@ -93,81 +199,67 @@ Item {
         Item { Layout.preferredHeight: 12 }
         TargetInputPanel { Layout.fillWidth: true; Layout.leftMargin: 12; Layout.rightMargin: 12 }
 
-         // Layer checkboxes — Timer-driven imperative updates inside component scope
+         // Layer checkboxes — bound to page-level snapshot (frozen during run)
         Item { Layout.preferredHeight: 8; visible: !compact }
-        Timer {
-            id: checkboxTimer
-            interval: 200; running: true; repeat: true
-            onTriggered: {
-                // Update checkState/enabled directly (IDs accessible inside component)
-                var cbs = [cb0,cb1,cb2,cb3,cb4]
-                for (var i = 0; i < 5; i++) {
-                    if (!cbs[i]) continue
-                    // canEnable logic
-                    var can = true
-                    if (appState.runStatus === 1) can = false
-                    else if (i === 3) can = (appState.target !== "")
-                    else if (i === 4) can = appState.isTargetUrl()
-                    cbs[i].enabled = can
-                    cbs[i].checkState = appState.isGroupAllEnabled(i) ? Qt.Checked :
-                                        appState.isGroupAnyEnabled(i) ? Qt.PartiallyChecked : Qt.Unchecked
-                }
-            }
-        }
         ColumnLayout {
             visible: !compact; spacing: 2
             Layout.leftMargin: 12; Layout.rightMargin: 12
-            Label { text: "Diagnosis Group"; font.family: "JetBrains Mono"; font.pixelSize: 11; font.weight: Font.DemiBold; color: Theme.textSecondary }
+            Label { text: Tr.diagGroup; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 11; font.weight: Font.DemiBold; color: Theme.textSecondary }
             Item { Layout.preferredHeight: 6 }
 
             // G1
             Rectangle { Layout.fillWidth: true; implicitHeight: 32; radius: 6
-                color: appState.isGroupAllEnabled(0) ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
+                color: page._snapG0chk ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
                 RowLayout { anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                     CheckBox { id: cb0; Layout.preferredWidth: 18; Layout.preferredHeight: 18
-                        onToggled: appState.setGroupEnabled(0, checkState === Qt.Checked) }
+                        enabled: !page._runActive
+                        onClicked: appState.setGroupEnabled(0, cb0.checked) }
                     Item { width: 8 }
-                    Label { Layout.fillWidth: true; text: appState.groupLabels[0]||""; font.family:"JetBrains Mono"; font.pixelSize:12 }
+                    Label { Layout.fillWidth: true; text: Tr.groupName(0); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:12 }
                 }
             }
             // G2
             Rectangle { Layout.fillWidth: true; implicitHeight: 32; radius: 6
-                color: appState.isGroupAllEnabled(1) ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
+                color: page._snapG1chk ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
                 RowLayout { anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                     CheckBox { id: cb1; Layout.preferredWidth: 18; Layout.preferredHeight: 18
-                        onToggled: appState.setGroupEnabled(1, checkState === Qt.Checked) }
+                        enabled: !page._runActive
+                        onClicked: appState.setGroupEnabled(1, cb1.checked) }
                     Item { width: 8 }
-                    Label { Layout.fillWidth: true; text: appState.groupLabels[1]||""; font.family:"JetBrains Mono"; font.pixelSize:12 }
+                    Label { Layout.fillWidth: true; text: Tr.groupName(1); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:12 }
                 }
             }
             // G3
             Rectangle { Layout.fillWidth: true; implicitHeight: 32; radius: 6
-                color: appState.isGroupAllEnabled(2) ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
+                color: page._snapG2chk ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
                 RowLayout { anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                     CheckBox { id: cb2; Layout.preferredWidth: 18; Layout.preferredHeight: 18
-                        onToggled: appState.setGroupEnabled(2, checkState === Qt.Checked) }
+                        enabled: !page._runActive
+                        onClicked: appState.setGroupEnabled(2, cb2.checked) }
                     Item { width: 8 }
-                    Label { Layout.fillWidth: true; text: appState.groupLabels[2]||""; font.family:"JetBrains Mono"; font.pixelSize:12 }
+                    Label { Layout.fillWidth: true; text: Tr.groupName(2); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:12 }
                 }
             }
             // G4
             Rectangle { Layout.fillWidth: true; implicitHeight: 32; radius: 6
-                color: appState.isGroupAllEnabled(3) ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
+                color: page._snapG3chk ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
                 RowLayout { anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                     CheckBox { id: cb3; Layout.preferredWidth: 18; Layout.preferredHeight: 18
-                        onToggled: appState.setGroupEnabled(3, checkState === Qt.Checked) }
+                        enabled: !page._runActive && page._snapG3en
+                        onClicked: appState.setGroupEnabled(3, cb3.checked) }
                     Item { width: 8 }
-                    Label { Layout.fillWidth: true; text: appState.groupLabels[3]||""; font.family:"JetBrains Mono"; font.pixelSize:12 }
+                    Label { Layout.fillWidth: true; text: Tr.groupName(3); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:12 }
                 }
             }
             // G5
             Rectangle { Layout.fillWidth: true; implicitHeight: 32; radius: 6
-                color: appState.isGroupAllEnabled(4) ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
+                color: page._snapG4chk ? Qt.alpha(Theme.accentBlue, 0.12) : "transparent"
                 RowLayout { anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                     CheckBox { id: cb4; Layout.preferredWidth: 18; Layout.preferredHeight: 18
-                        onToggled: appState.setGroupEnabled(4, checkState === Qt.Checked) }
+                        enabled: !page._runActive && page._snapG4en
+                        onClicked: appState.setGroupEnabled(4, cb4.checked) }
                     Item { width: 8 }
-                    Label { Layout.fillWidth: true; text: appState.groupLabels[4]||""; font.family:"JetBrains Mono"; font.pixelSize:12 }
+                    Label { Layout.fillWidth: true; text: Tr.groupName(4); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:12 }
                 }
             }
         }
@@ -207,7 +299,7 @@ Item {
     component ContentArea: ColumnLayout {
         spacing: 0
 
-        // Header bar
+        // Header bar — status label, progress counter
         Rectangle {
             Layout.fillWidth: true; implicitHeight: 41
             color: "#1A1A2E"
@@ -216,23 +308,20 @@ Item {
                 AppIcon { name: "diagnostics"; size: 18; color: Theme.cyan }
                 Item { width: 8 }
                 Label {
-                    text: _runStatus === 1 ? "Running Diagnostics..." :
-                          _runStatus === 2 ? "Diagnostic Complete" :
-                          _runStatus === 3 ? "Cancelled" :
-                          _runStatus === 4 ? "Error — Check Target" : "Results"
-                    font.family: "JetBrains Mono"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary
+                    text: _runStatus === 1 ? Tr.runningDots :
+                          _runStatus === 2 ? Tr.complete :
+                          _runStatus === 3 ? Tr.cancelled :
+                          _runStatus === 4 ? Tr.errorCheck : Tr.results
+                    font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary
+                }
+                // Progress counter — visible during run
+                Label {
+                    visible: _runStatus === 1 && _totalTests > 0
+                    text: _totalCompleted + " / " + _totalTests
+                    font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12
+                    font.weight: Font.DemiBold; color: Theme.cyan
                 }
                 Item { Layout.fillWidth: true }
-                Button {
-                    visible: _runStatus >= 2 && _totalCompleted > 0
-                    implicitHeight: 32
-                    text: "Reset"
-                    font.family: "JetBrains Mono"; font.pixelSize: 12
-                    flat: true
-                    background: Rectangle { radius: 6; color: "transparent"; border { width: 1; color: "#5A5A7A" } }
-                    contentItem: Label { text: "↻ Reset"; font: parent.font; color: Theme.textSecondary; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                    onClicked: appState.reset()
-                }
             }
         }
 
@@ -243,25 +332,29 @@ Item {
                 anchors.centerIn: parent; spacing: 16
                 visible: _runStatus === 0 && _totalCompleted === 0
                 AppIcon { anchors.horizontalCenter: parent.horizontalCenter; name: "wifi"; size: 80; color: Qt.alpha(Theme.textSecondary, 0.2) }
-                Label { anchors.horizontalCenter: parent.horizontalCenter; text: "Enter a target and press Run"; font.family: "JetBrains Mono"; font.pixelSize: 15; font.weight: Font.Medium; color: Qt.alpha(Theme.textSecondary, 0.6) }
-                Label { anchors.horizontalCenter: parent.horizontalCenter; text: "Analyze your network with a single click"; font.family: "JetBrains Mono"; font.pixelSize: 12; color: Qt.alpha(Theme.textSecondary, 0.4) }
+                Label { anchors.horizontalCenter: parent.horizontalCenter; text: Tr.runDiag; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 15; font.weight: Font.Medium; color: Qt.alpha(Theme.textSecondary, 0.6) }
             }
-            // Simple Column — no Flickable, no contentHeight binding issues
-            Column {
-                id: treeColumn
+            // Flickable results list — scrolls when content exceeds viewport
+            Flickable {
+                id: resultsFlick
                 anchors { fill: parent; margins: 4 }
                 visible: _totalCompleted > 0 || _runStatus === 1
-                spacing: 4
-                Repeater {
-                    model: visibleGroups
-                    delegate: TestGroupPanel {
-                        anchors { left: parent.left; right: parent.right }
-                        groupIndex: modelData
+                clip: true
+                contentWidth: width
+                contentHeight: treeColumn.implicitHeight
+                boundsBehavior: Flickable.StopAtBounds
+                Column {
+                    id: treeColumn
+                    width: parent.width
+                    spacing: 4
+                    Repeater {
+                        model: visibleGroups
+                        delegate: TestGroupPanel {
+                            anchors { left: parent.left; right: parent.right }
+                            groupIndex: modelData
                         onDetailClicked: function(data) {
                             var tid = data.testId
                             var d = appState.getDetailResult(tid)
-                            // Force re-evaluation: clear first, then set
-                            page.currentDetail = {}
                             dtTitle.text = (d && d.displayName) ? d.displayName : (data.displayName || "Test #" + tid)
                             var statStr = "Unknown"
                             if (d && d.status !== undefined) statStr = ["Pass","Warning","Fail","Skipped","Error","Info"][d.status] || "Unknown"
@@ -269,47 +362,23 @@ Item {
                             dtStatus.text = "Status: " + statStr + "    Duration: " + durStr + "ms"
                             dtSummary.text = (d && d.summary) ? d.summary : (data.summary || "")
                             dtOutput.text = (d && d.details) ? d.details : ""
-                            page.currentDetail = d
+                            page.currentDetail = d || {}
                             detailOverlay.visible = true
+                            // DEBUG: verify monospace font actually applied
+                            Qt.callLater(function() {
+                                console.log("[FONT-DEBUG] requested family:", dtOutput.font.family)
+                                console.log("[FONT-DEBUG] resolved family:", dtOutput.fontInfo.family)
+                                console.log("[FONT-DEBUG] pixelSize:", dtOutput.fontInfo.pixelSize)
+                                console.log("[FONT-DEBUG] text length:", dtOutput.text.length)
+                                console.log("[FONT-DEBUG] text first 200 chars:", dtOutput.text.substring(0, 200))
+                            })
                         }
                     }
                 }
             }
+            }  // Flickable
         }
 
-        // Bottom bar
-        Rectangle {
-            Layout.fillWidth: true; implicitHeight: 40
-            color: "#1A1A2E"
-            border { width: 1; color: "#3A3A5A" }
-            // Polled LiveProgress
-            RowLayout {
-                anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
-                visible: _runStatus >= 1 && _runStatus <= 4
-                spacing: 8
-                Label {
-                    text: _runStatus === 1 ? "⟳" : _runStatus === 2 ? "✓" : _runStatus === 3 ? "✗" : _runStatus === 4 ? "⚠" : "○"
-                    font.pixelSize: 14
-                    color: _runStatus === 1 ? Theme.cyan : _runStatus === 2 ? Theme.passGreen : _runStatus === 3 ? Theme.warnYellow : _runStatus === 4 ? Theme.failRed : Qt.alpha(Theme.textSecondary, 0.4)
-                }
-                Label {
-                    text: _runStatus === 1 ? "Running" : _runStatus === 2 ? "Complete" : _runStatus === 3 ? "Cancelled" : _runStatus === 4 ? "Error" : "Ready"
-                    font.family: "JetBrains Mono"; font.pixelSize: 12; font.weight: Font.DemiBold
-                    color: _runStatus === 1 ? Theme.cyan : _runStatus === 2 ? Theme.passGreen : _runStatus === 3 ? Theme.warnYellow : _runStatus === 4 ? Theme.failRed : Theme.textSecondary
-                }
-                AppIcon { visible: appState.errorMessage !== ""; name: "warning"; size: 14; color: Theme.failRed }
-                Item { Layout.fillWidth: true }
-                Label { visible: _runStatus === 1; text: appState.currentTestLabel || ""; font.family: "JetBrains Mono"; font.pixelSize: 11; font.italic: true; color: Theme.cyan; elide: Text.ElideRight; Layout.maximumWidth: 300 }
-                Label { visible: _totalTests > 0; text: _totalCompleted + " / " + _totalTests; font.family: "JetBrains Mono"; font.pixelSize: 11; font.weight: Font.DemiBold; color: Theme.textSecondary }
-            }
-            RowLayout {
-                anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
-                visible: _runStatus === 0
-                AppIcon { name: "circle"; size: 14; color: Theme.textSecondary }
-                Item { width: 8 }
-                Label { text: "Ready"; font.family: "JetBrains Mono"; font.pixelSize: 12; font.weight: Font.DemiBold; color: Theme.textSecondary }
-            }
-        }
     }
 
     // ── Detail popup — anchors to root window for full coverage ──────
@@ -319,6 +388,17 @@ Item {
         anchors.fill: parent
         color: "#88000000"
         visible: false; z: 1000
+
+        onVisibleChanged: {
+            if (!visible) {
+                // Clear stale state to prevent flash on next open
+                dtTitle.text = ""
+                dtStatus.text = ""
+                dtSummary.text = ""
+                dtOutput.text = ""
+                page.currentDetail = {}
+            }
+        }
 
         MouseArea {
             anchors.fill: parent
@@ -337,30 +417,34 @@ Item {
             Rectangle {
                 anchors { top: parent.top; right: parent.right; topMargin: 10; rightMargin: 10 }
                 width: 28; height: 28; radius: 14; color: "#E94560"
-                Label { anchors.centerIn: parent; text: "✕"; font.pixelSize: 14; font.weight: Font.Bold; color: "white" }
+                AppIcon { anchors.centerIn: parent; name: "close"; size: 14; color: "white" }
                 MouseArea { anchors.fill: parent; onClicked: detailOverlay.visible = false }
             }
 
             Flickable {
                 anchors { fill: parent; margins: 16; topMargin: 44 }
                 clip: true
-                contentWidth: width
+                contentWidth: Math.max(width, detailCol.implicitWidth)
                 contentHeight: detailCol.implicitHeight
+                // Horizontal scrollbar for wide diagnostic table output
+                ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
                 Column {
-                    id: detailCol; width: parent.width; spacing: 8
-                    Label { id: dtTitle; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 16; font.weight: Font.DemiBold; color: "#FFFFFF"; elide: Text.ElideRight }
-                    Label { id: dtStatus; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 12; color: "#A0A0B8" }
-                    Label { id: dtSummary; text: ""; font.family: "JetBrains Mono"; font.pixelSize: 12; color: "#E0E0E0"; wrapMode: Text.WordWrap }
-                    Rectangle { implicitWidth: 500; height: 1; color: "#3A3A5A" }
+                    id: detailCol; spacing: 8
+                    // Allow Column to grow wider than viewport for horizontal scrolling
+                    width: Math.max(parent.width, implicitWidth)
+                    Label { id: dtTitle; text: ""; textFormat:Text.PlainText; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:16; font.weight:Font.DemiBold; color:"#FFFFFF"; elide:Text.ElideRight }
+                    Label { id: dtStatus; text: ""; textFormat:Text.PlainText; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:12; color:"#A0A0B8" }
+                    Label { id: dtSummary; text: ""; textFormat:Text.PlainText; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:12; color:"#E0E0E0"; wrapMode:Text.WordWrap }
+                    Rectangle { width: parent.width; height: 1; color: "#3A3A5A" }
                     Repeater {
                         model: currentDetail.properties || []
                         delegate: Row {
                             spacing: 4
-                            Label { text: (modelData["label"]||"?")+":"; font.family:"JetBrains Mono"; font.pixelSize:11; font.weight:Font.DemiBold; color:"#A0A0B8"; width:120 }
-                            Label { text: modelData["value"]||""; font.family:"JetBrains Mono"; font.pixelSize:11; color:"#E0E0E0"; wrapMode:Text.WordWrap }
+                            Label { text: (modelData["label"]||"?")+":"; textFormat:Text.PlainText; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:11; font.weight:Font.DemiBold; color:"#A0A0B8"; width:120 }
+                            Label { text: modelData["value"]||""; textFormat:Text.PlainText; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:11; color:"#E0E0E0"; wrapMode:Text.WordWrap }
                         }
                     }
-                    Label { id: dtOutput; text: ""; font.family:"JetBrains Mono"; font.pixelSize:10; color:"#A0A0B8"; wrapMode:Text.WordWrap; visible:text!=="" }
+                    Label { id: dtOutput; text: ""; textFormat:Text.PlainText; font.family: dejavuMono.name; font.pixelSize:10; color:"#A0A0B8"; wrapMode:Text.NoWrap; visible:text!=="" }
                 }
             }
         }

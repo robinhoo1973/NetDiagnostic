@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import "../widgets"
+import "../"
 
 ApplicationWindow {
     id: page
@@ -12,154 +13,132 @@ ApplicationWindow {
     property int currentTab: 1
 
     Component.onCompleted: {
-        showFullScreen()
-        if (visibility !== Window.FullScreen) {
-            width = Screen.desktopAvailableWidth * 0.9
-            height = Screen.desktopAvailableHeight * 0.9
-            x = (Screen.desktopAvailableWidth - width) / 2
-            y = (Screen.desktopAvailableHeight - height) / 2
-        }
+        width = Screen.desktopAvailableWidth
+        height = Screen.desktopAvailableHeight
+        x = 0; y = 0
+        Qt.callLater(recalcScale)
     }
 
     FontLoader { source: "qrc:/fonts/JetBrainsMono-Regular.ttf" }
     FontLoader { source: "qrc:/fonts/JetBrainsMono-Bold.ttf" }
 
     property var devices: [
-        { id:"ip15", name:"iPhone 15 Pro",  os:"ios",     w:393, h:852, bezel:4, island:true,  radius:47 },
-        { id:"se",   name:"iPhone SE",      os:"ios",     w:375, h:667, bezel:8, island:false, radius:20 },
-        { id:"px8",  name:"Pixel 8 Pro",    os:"android", w:412, h:915, bezel:4, island:false, radius:28 },
-        { id:"dt",   name:"Generic Desktop", os:"linux",  w:800, h:500, bezel:0, island:false, radius:8  }
+        { id:"win-x64",   name:"Windows 11 (x64)",     os:"windows", w:1024,h:640, bezel:0, island:false, radius:8 },
+        { id:"win-arm64", name:"Windows 11 (ARM64)",   os:"windows", w:1024,h:640, bezel:0, island:false, radius:8 },
+        { id:"lx-x64",    name:"Ubuntu 24.04 (x64)",   os:"linux",   w:1024,h:640, bezel:0, island:false, radius:8 },
+        { id:"lx-arm64",  name:"Ubuntu 24.04 (ARM64)", os:"linux",   w:1024,h:640, bezel:0, island:false, radius:8 },
+        { id:"mac-x64",   name:"macOS 15 (x64)",       os:"macos",   w:1024,h:640, bezel:0, island:false, radius:8 },
+        { id:"mac-arm64", name:"macOS 15 (ARM64)",     os:"macos",   w:1024,h:640, bezel:0, island:false, radius:8 }
     ]
     property int currentDevice: 0
     property bool portrait: true
-    onPortraitChanged: scaled.scale = calcScale()
-    onCurrentDeviceChanged: scaled.scale = calcScale()
+    onPortraitChanged: recalcScale()
+    onCurrentDeviceChanged: recalcScale()
+    onWidthChanged: recalcScale()
+    onHeightChanged: recalcScale()
 
-    function cur() { return devices[currentDevice] }
-    function osColor(os) {
-        if (os==="ios") return "#007AFF"
-        if (os==="android") return "#3DDC84"
-        if (os==="linux") return "#FCC624"
-        return "#888"
+    // Polling fallback — ARM64 Qt signals may be dropped, Timer guarantees update
+    Timer { interval: 200; running: true; repeat: true; onTriggered: recalcScale() }
+
+    function recalcScale() {
+        var w = page.width; var h = page.height - 48
+        var p = portrait; var d = cur()
+        console.warn("[SIM] recalcScale w=", w, "h=", h, "portrait=", p, "dev=", d.name)
+        if (w <= 0 || h <= 0) { console.warn("[SIM] recalcScale SKIP"); return }
+        var dev_sw = p ? d.w : d.h
+        var dev_sh = p ? d.h : d.w
+        var dev_bh = (d.os==="windows"||d.os==="linux") ? 0 : d.bezel
+        var fw = dev_sw + dev_bh*2
+        var fh = dev_sh + dev_bh*2 + 36
+	var s = Math.max(0.1, Math.min((w-16)/fw, (h-16)/fh))
+        // All dimensions at natural size — Scale transform handles visual scaling
+        deviceFrame.width = fw; deviceFrame.height = fh
+        deviceFrame.radius = (d.os==="windows"||d.os==="linux") ? d.radius+2 : d.radius+dev_bh
+        deviceFrame.color = (d.os==="windows"||d.os==="linux") ? "#1E1E2E" : "#0A0A0A"
+        deviceFrame.border.width = (d.os==="windows"||d.os==="linux") ? 1 : 0
+        screenRect.x = dev_bh; screenRect.y = dev_bh
+        screenRect.width = dev_sw; screenRect.height = dev_sh + 36
+        screenRect.radius = d.radius
+        // Natural size — Scale transform handles visual
+        scaled.width = fw; scaled.height = fh
+        scaled.scale = s
+        scaled.x = (page.width - fw * s) / 2
+        scaled.y = 0
+        console.warn("[SIM] fw=",fw,"fh=",fh,"scale=",s,"x=",scaled.x,"y=",scaled.y)
     }
 
-    // ── Layout ────────────────────────────────────────────────────────
+    function cur() { return devices[currentDevice] }
+    function isMobile() { return false }
+    function isDesktop(){ return true }
+
+    function osIcon(os) {
+        if (os==="linux") return "linux"; if (os==="windows") return "windows"
+        if (os==="macos") return "apple"
+        return "circle"
+    }
+    function osColor(os) {
+        if (os==="linux") return "#FCC624"; if (os==="windows") return "#00A4EF"
+        if (os==="macos") return "#007AFF"
+        return "#888"
+    }
+    function osLabel(os) {
+        if (os==="linux") return "Linux"; if (os==="windows") return "Windows"
+        if (os==="macos") return "macOS"
+        return os
+    }
+
+    // ── Outer layout ────────────────────────────────────────────────────
     ColumnLayout {
         anchors.fill: parent; spacing: 0
 
-        // Top area: AppBar + NavBar
+        // Top bar — device selector
         Rectangle {
-            Layout.fillWidth: true; implicitHeight: 88; color: "#1A1A2E"; z: 10
-            ColumnLayout {
-                anchors.fill: parent; spacing: 0
-                // AppBar
-                RowLayout {
-                    Layout.fillWidth: true; Layout.preferredHeight: 48
-                    anchors { leftMargin: 16; rightMargin: 12 }
-                    Label { text:"NetAnalysis Simulator"; font.family:"JetBrains Mono"; font.pixelSize:16; font.weight:Font.DemiBold; color:"white" }
-                    Item { Layout.fillWidth:true }
-                    // Device selector
-                    Rectangle { implicitWidth:160; implicitHeight:34; radius:4; color:Qt.alpha("white",0.08); border{width:1;color:Qt.alpha("white",0.15)}
-                        RowLayout { anchors.fill:parent; anchors.margins:8
-                            Label { Layout.fillWidth:true; text:cur().name; font.family:"JetBrains Mono"; font.pixelSize:12; color:"white" }
-                            Label { text:"▾"; font.pixelSize:14; color:Qt.alpha("white",0.6) }
-                        }
-                        MouseArea { anchors.fill:parent; onClicked:devicePopup.open() }
+            Layout.fillWidth: true; implicitHeight: 48; color: "#1A1A2E"; z: 10
+            RowLayout {
+                anchors { fill: parent; leftMargin: 16; rightMargin: 12 }
+                Label { text:"NetAnalysis Simulator"; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:16; font.weight:Font.DemiBold; color:"white" }
+                Item { Layout.fillWidth:true }
+                Rectangle { implicitWidth:180; implicitHeight:34; radius:4; color:Qt.alpha("white",0.08); border{width:1;color:Qt.alpha("white",0.15)}
+                    RowLayout { anchors.fill:parent; anchors.margins:8
+                        AppIcon { name:osIcon(cur().os); size:14; color:osColor(cur().os) }
+                        Label { Layout.fillWidth:true; text:cur().name; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:12; color:"white" }
+                        Label { text:"▾"; font.pixelSize:14; color:Qt.alpha("white",0.6) }
                     }
-                    Item { width:8 }
-                    Rectangle { implicitWidth:34; implicitHeight:34; radius:4; color:"transparent"; border{width:1;color:Qt.alpha("white",0.2)}
-                        Label { anchors.centerIn:parent; text:portrait?"↻":"↕"; font.pixelSize:18; color:Qt.alpha("white",0.7) }
-                        MouseArea { anchors.fill:parent; onClicked:portrait=!portrait }
-                    }
+                    MouseArea { anchors.fill:parent; onClicked:devicePopup.open() }
                 }
-                // NavBar
-                RowLayout {
-                    Layout.fillWidth:true; Layout.preferredHeight:40
-                    anchors { leftMargin:16; rightMargin:16 }
-                    Repeater {
-                        model: ["Dashboard","Diagnostics","Config","Report","Settings"]
-                        delegate: ItemDelegate {
-                            implicitWidth:90; implicitHeight:36
-                            background: Rectangle { color:index===page.currentTab?Qt.alpha(Theme.cyan,0.12):"transparent"; radius:8 }
-                            contentItem: Label { anchors.centerIn:parent; text:modelData; font.family:"JetBrains Mono"; font.pixelSize:10; color:index===page.currentTab?Theme.cyan:Theme.textSecondary }
-                            onClicked: page.currentTab=index
-                        }
-                    }
+                Item { width:8 }
+                Rectangle { implicitWidth:34; implicitHeight:34; radius:4; color:"transparent"; border{width:1;color:Qt.alpha("white",0.2)}
+                    AppIcon { anchors.centerIn:parent; name:"refresh"; size:16; color:Qt.alpha("white",0.7) }
+                    MouseArea { anchors.fill:parent; onClicked:portrait=!portrait }
                 }
             }
         }
 
-        // Body: scaled device frame
-        Item {
-            id: body
-            Layout.fillWidth: true; Layout.fillHeight: true
-
-            function calcScale() {
-                var d = cur()
-                var sw = portrait ? d.w : d.h
-                var sh = portrait ? d.h : d.w
-                var tw = sw + d.bezel*2 + 16
-                var th = sh + d.bezel*2 + 16 + (d.island?30:0)
-                return Math.max(0.1, Math.min(3.0, Math.min((width-8)/tw, (height-8)/th)))
-            }
-
+        // Body — Rectangle (not Item) ensures Layout assigns proper width/height
+        Rectangle {
+            id: body; Layout.fillWidth: true; Layout.fillHeight: true; color: "transparent"
             Item {
                 id: scaled
-                anchors.centerIn: parent
-                property real scale: body.calcScale()
-                width: deviceFrame.width * scale
-                height: deviceFrame.height * scale
+                property real scale: 0.5
+                transform: Scale { xScale: scaled.scale; yScale: scaled.scale }
 
                 Rectangle {
                     id: deviceFrame
-                    property var d: cur()
-                    property real sw: portrait ? d.w : d.h
-                    property real sh: portrait ? d.h : d.w
-                    property real bh: d.bezel
-                    width: sw + bh*2
-                    height: sh + bh*2 + (d.island?30:0)
-                    radius: d.radius + bh
-                    color: d.bezel>0 ? "#0A0A0A" : "transparent"
-                    border { width:d.bezel>0?0:1; color:"#333" }
+                    color: "#0A0A0A"
+                    border { width: 0; color: "#444" }
 
-                    // Screen area
+                    // ── Screen ──────────────────────────────────────────
                     Rectangle {
-                        anchors.centerIn: parent
-                        anchors.verticalCenterOffset: deviceFrame.d.island ? -15 : 0
-                        width: deviceFrame.sw; height: deviceFrame.sh
-                        radius: deviceFrame.d.radius
-                        color: "#2E2E4E"
-                        clip: true
+                        id: screenRect
+                        color: "#1E1E2E"; clip: true
 
-                        // Status bar
-                        Rectangle {
-                            anchors { top:parent.top; left:parent.left; right:parent.right }
-                            height: 24; color: "#1A1A2E"
-                            RowLayout {
-                                anchors { fill:parent; leftMargin:16; rightMargin:12 }
-                                Label { text:"9:41"; font.family:"JetBrains Mono"; font.pixelSize:10; color:"#A0A0B8" }
-                                Item { Layout.fillWidth:true }
-                                Label { text:"●●●●○"; font.pixelSize:8; color:"#4ADE80" }
-                            }
-                        }
-
-                        // Page stack
-                        StackView {
-                            id: simStack
+                        // ── Production GUI (shared with main.qml) ────────────────
+                        AppContent {
+                            id: appContent
                             anchors.fill: parent
-                            anchors.topMargin: 24
-                            Component.onCompleted: push("../screens/DiagnosticScreen.qml")
-
-                            Connections {
-                                target: page
-                                function onCurrentTabChanged() {
-                                    var screens = ["../screens/DashboardScreen.qml","../screens/DiagnosticScreen.qml","../screens/ConfigScreen.qml","../screens/ReportScreen.qml","../screens/SettingsScreen.qml"]
-                                    if (page.currentTab >=0 && page.currentTab < screens.length) {
-                                        simStack.clear()
-                                        simStack.push(screens[page.currentTab])
-                                    }
-                                }
-                            }
+                            onCloseRequested: close()
+                            compact: cur().os === "ios" || cur().os === "android"
+                            onCurrentTabChanged: page.currentTab = appContent.currentTab
                         }
                     }
                 }
@@ -170,18 +149,24 @@ ApplicationWindow {
     // ── Device popup ───────────────────────────────────────────────────
     Popup {
         id: devicePopup
-        y: 90; x: Math.max(page.width - 300, 0)
-        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-        width: 260; height: Math.min(200, devices.length * 46 + 8); padding: 6
+        y: 90; x: Math.max(page.width-310,0)
+        closePolicy: Popup.CloseOnEscape|Popup.CloseOnPressOutside
+        width: 290; height: Math.min(450, devices.length*54+16); padding: 8
         background: Rectangle { radius:10; color:"#1E1E2E"; border{width:1;color:"#3A3A5A"} }
         ListView {
             anchors.fill:parent; clip:true; model:devices
             delegate: ItemDelegate {
-                width:ListView.view.width; implicitHeight:44
-                contentItem: RowLayout { spacing:8
-                    Label { text:modelData.name; font.family:"JetBrains Mono"; font.pixelSize:13; color:"white"; Layout.fillWidth:true }
-                    Rectangle { implicitWidth:32; implicitHeight:20; radius:4; color:Qt.alpha(osColor(modelData.os),0.15)
-                        Label { anchors.centerIn:parent; text:modelData.os.substring(0,1).toUpperCase(); font.family:"JetBrains Mono"; font.pixelSize:10; color:"white" }
+                width:ListView.view.width; implicitHeight:50
+                contentItem: RowLayout { spacing:10
+                    Rectangle { implicitWidth:32; implicitHeight:32; radius:8; color:Qt.alpha(osColor(modelData.os),0.15)
+                        AppIcon { anchors.centerIn:parent; name:osIcon(modelData.os); size:18; color:osColor(modelData.os) } }
+                    ColumnLayout { spacing:1
+                        Label { text:modelData.name; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:13; color:"white" }
+                        RowLayout { spacing:6
+                            Rectangle { implicitWidth:44; implicitHeight:16; radius:3; color:Qt.alpha(osColor(modelData.os),0.2)
+                                Label { anchors.centerIn:parent; text:osLabel(modelData.os); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:8; font.weight:Font.DemiBold; color:osColor(modelData.os) } }
+                            Label { text:(modelData.w)+"×"+(modelData.h); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:9; color:Qt.alpha("white",0.4) }
+                        }
                     }
                 }
                 background: Rectangle { color:index===currentDevice?Qt.alpha("#0078D4",0.2):"transparent"; radius:6 }

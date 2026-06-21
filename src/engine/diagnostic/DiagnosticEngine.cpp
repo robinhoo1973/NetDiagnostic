@@ -2,7 +2,7 @@
 // DiagnosticEngine.cpp
 // =============================================================================
 #include "engine/diagnostic/DiagnosticEngine.h"
-#include "engine/PlatformCommand.h"
+#include "engine/diagnostic/G1G2G3Native.h"
 #include "engine/diagnostic/G4RemoteHost.h"
 #include "engine/diagnostic/G5WebsiteUrl.h"
 #include "engine/runner/NetworkProbe.h"
@@ -11,9 +11,8 @@
 #include "util/PingParser.h"
 #include <QtConcurrent/QtConcurrent>
 
-DiagnosticEngine::DiagnosticEngine(std::unique_ptr<PlatformCommand> cmd, QObject* parent)
+DiagnosticEngine::DiagnosticEngine(QObject* parent)
     : QObject(parent)
-    , m_cmd(std::move(cmd))
 {
     // Initialize native plugin (non-fatal if unavailable)
     NativeService::instance().initialize();
@@ -23,7 +22,7 @@ DiagnosticEngine::~DiagnosticEngine() {
     m_destroying.store(true, std::memory_order_release);
 }
 
-QFuture<DiagnosticResult> DiagnosticEngine::runTest(TestId id, const QString& target,
+QFuture<DiagnosticResult> DiagnosticEngine::runTest(DiagId id, const QString& target,
                                                        int fromPort, int toPort, bool useCommonPorts) {
     // Capture a raw pointer — the atomic m_destroying flag guards against
     // use-after-free during shutdown. The engine is parented to AppState so
@@ -33,7 +32,7 @@ QFuture<DiagnosticResult> DiagnosticEngine::runTest(TestId id, const QString& ta
         fprintf(stderr, "[TRACE] runTest lambda id=%d ENTER\n", (int)id);
         if (engine->m_destroying.load(std::memory_order_acquire))
             return DiagnosticResult::error(id, QStringLiteral("Engine shutting down"));
-        TestGroup group = testGroup(id);
+        DiagGroup group = testGroup(id);
 
         // Try native plugin first
         fprintf(stderr, "[TRACE] runTest id=%d calling tryNative\n", (int)id);
@@ -47,17 +46,17 @@ QFuture<DiagnosticResult> DiagnosticEngine::runTest(TestId id, const QString& ta
 
         // Fall back to Qt C++ implementation
         switch (group) {
-            case TestGroup::G1: return engine->runG1(id, target);
-            case TestGroup::G2: return engine->runG2(id, target);
-            case TestGroup::G3: return engine->runG3(id, target);
-            case TestGroup::G4: return engine->runG4(id, target, fromPort, toPort, useCommonPorts);
-            case TestGroup::G5: return engine->runG5(id, target);
+            case DiagGroup::G1: return engine->runG1(id, target);
+            case DiagGroup::G2: return engine->runG2(id, target);
+            case DiagGroup::G3: return engine->runG3(id, target);
+            case DiagGroup::G4: return engine->runG4(id, target, fromPort, toPort, useCommonPorts);
+            case DiagGroup::G5: return engine->runG5(id, target);
         }
         return DiagnosticResult::error(id, QStringLiteral("Unknown group"));
     });
 }
 
-std::optional<DiagnosticResult> DiagnosticEngine::tryNative(TestId id, const QString& target,
+std::optional<DiagnosticResult> DiagnosticEngine::tryNative(DiagId id, const QString& target,
                                                              int fromPort, int toPort) {
     auto& ns = NativeService::instance();
     if (!ns.isAvailable() || !ns.isNativeCapable(id))
@@ -67,183 +66,192 @@ std::optional<DiagnosticResult> DiagnosticEngine::tryNative(TestId id, const QSt
 
 // ── G1: System & Adapters ──────────────────────────────────────────────────
 
-DiagnosticResult DiagnosticEngine::runG1(TestId id, const QString& target) {
+DiagnosticResult DiagnosticEngine::runG1(DiagId id, const QString& target) {
     Q_UNUSED(target)
-    auto* cmd = m_cmd.get();
-    QString exe;
-    QStringList args;
 
     switch (id) {
-        case TestId::G1NetworkAdapters: {
-            // Fallback: ip link (Linux) — native plugin handles primary path
-            exe = cmd->shellExecutable();
-            args = cmd->shellArguments(QStringLiteral("ip -br link show || ifconfig"));
-            break;
-        }
-        case TestId::G1WifiDiagnostics: {
-            exe = cmd->shellExecutable();
-            args = cmd->shellArguments(QStringLiteral("iw dev 2>/dev/null || nmcli device wifi list 2>/dev/null"));
-            break;
-        }
-        case TestId::G1ActiveConnections: {
-            exe = cmd->shellExecutable();
-            args = cmd->shellArguments(QStringLiteral("ss -tan 2>/dev/null || netstat -an"));
-            break;
-        }
-        case TestId::G1DhcpStatus: {
-            exe = cmd->shellExecutable();
-            args = cmd->shellArguments(QStringLiteral("nmcli device show 2>/dev/null || cat /var/lib/dhcp/dhclient.leases 2>/dev/null"));
-            break;
-        }
-        case TestId::G1IpConfiguration: {
-            exe = cmd->shellExecutable();
-            args = cmd->shellArguments(QStringLiteral("ip addr show 2>/dev/null && ip route show default 2>/dev/null || ifconfig"));
-            break;
-        }
-        default: {
-            // NicAdvanced, Wired — native-only for now
-            return DiagnosticResult::skipped(id, QStringLiteral("Runs via native plugin"));
-        }
+        case DiagId::G1NetworkAdapters:   return G1G2G3Native::networkAdapters(id);
+        case DiagId::G1NicAdvanced:       return G1G2G3Native::nicAdvanced(id);
+        case DiagId::G1WifiDiagnostics:   return G1G2G3Native::wifiDiagnostics(id);
+        case DiagId::G1WiredDiagnostics:  return G1G2G3Native::wiredDiagnostics(id);
+        case DiagId::G1DhcpStatus:        return G1G2G3Native::dhcpStatus(id);
+        case DiagId::G1IpConfiguration:   return G1G2G3Native::ipConfiguration(id);
+        case DiagId::G1ActiveConnections: return G1G2G3Native::activeConnections(id);
+        default:
+            return DiagnosticResult::skipped(id, QStringLiteral("Unknown G1 test"));
     }
-
-    ProcessResult r = cmd->runAndWait(exe, args, testGroupTimeoutSec(TestGroup::G1) * 1000);
-    DiagnosticResult result;
-    result.id = id;
-    result.group = TestGroup::G1;
-    result.status = r.isSuccess() ? TestStatus::Pass : TestStatus::Warning;
-    result.summary = r.isSuccess() ? QStringLiteral("OK") : QStringLiteral("Command failed");
-    result.rawOutput = r.stdoutStr;
-    result.errorOutput = r.stderrStr;
-    result.timestamp = QDateTime::currentDateTime();
-    return result;
 }
 
 // ── G2: Connectivity & Security ────────────────────────────────────────────
 
-DiagnosticResult DiagnosticEngine::runG2(TestId id, const QString& target) {
+DiagnosticResult DiagnosticEngine::runG2(DiagId id, const QString& target) {
     Q_UNUSED(target)
-    auto* cmd = m_cmd.get();
 
     switch (id) {
-        case TestId::G2RoutingTable: {
-            ProcessResult r = cmd->runAndWait(cmd->shellExecutable(),
-                cmd->shellArguments(QStringLiteral("ip route show 2>/dev/null || route print")),
-                testGroupTimeoutSec(TestGroup::G2) * 1000);
-            DiagnosticResult res;
-            res.id = id;
-            res.group = TestGroup::G2;
-            res.status = r.isSuccess() ? TestStatus::Pass : TestStatus::Warning;
-            res.summary = r.isSuccess() ? QStringLiteral("Route table read") : QStringLiteral("Failed");
-            res.rawOutput = r.stdoutStr;
-            res.timestamp = QDateTime::currentDateTime();
-            return res;
-        }
-        case TestId::G2ArpTable: {
-            ProcessResult r = cmd->runAndWait(cmd->shellExecutable(),
-                cmd->shellArguments(QStringLiteral("ip neigh show 2>/dev/null || arp -a")),
-                testGroupTimeoutSec(TestGroup::G2) * 1000);
-            DiagnosticResult res;
-            res.id = id;
-            res.group = TestGroup::G2;
-            res.status = r.isSuccess() ? TestStatus::Pass : TestStatus::Warning;
-            res.summary = r.isSuccess() ? QStringLiteral("ARP table read") : QStringLiteral("Failed");
-            res.rawOutput = r.stdoutStr;
-            res.timestamp = QDateTime::currentDateTime();
-            return res;
-        }
-        default: {
-            // NetworkProfile, TcpSettings, DefaultGateway, ProxySettings — native plugin
-            return DiagnosticResult::skipped(id, QStringLiteral("Runs via native plugin"));
-        }
+        case DiagId::G2NetworkProfile:    return G1G2G3Native::networkProfile(id);
+        case DiagId::G2TcpSettings:       return G1G2G3Native::tcpSettings(id);
+        case DiagId::G2DefaultGateway:    return G1G2G3Native::defaultGateway(id);
+        case DiagId::G2RoutingTable:      return G1G2G3Native::routingTable(id);
+        case DiagId::G2ArpTable:          return G1G2G3Native::arpTable(id);
+        case DiagId::G2ProxySettings:     return G1G2G3Native::proxySettings(id);
+        default:
+            return DiagnosticResult::skipped(id, QStringLiteral("Unknown G2 test"));
     }
 }
 
 // ── G3: Internet & DNS ─────────────────────────────────────────────────────
 
-DiagnosticResult DiagnosticEngine::runG3(TestId id, const QString& target) {
+DiagnosticResult DiagnosticEngine::runG3(DiagId id, const QString& target) {
     Q_UNUSED(target)
-    auto* cmd = m_cmd.get();
 
     switch (id) {
-        case TestId::G3NetskopeStatus: {
-            ProcessResult r = cmd->runAndWait(cmd->shellExecutable(),
-                cmd->shellArguments(QStringLiteral("pgrep nsproxy 2>/dev/null || tasklist /FI \"IMAGENAME eq nsproxy.exe\" 2>/dev/null")),
-                5000);
-            DiagnosticResult res;
-            res.id = id;
-            res.group = TestGroup::G3;
-            bool found = r.exitCode == 0 || r.stdoutStr.contains("nsproxy", Qt::CaseInsensitive);
-            res.status = found ? TestStatus::Pass : TestStatus::Warning;
-            res.summary = found ? QStringLiteral("netskope client running") : QStringLiteral("netskope not detected");
-            res.timestamp = QDateTime::currentDateTime();
-            return res;
-        }
-        case TestId::G3DnsServers: {
-            ProcessResult r = cmd->runAndWait(cmd->shellExecutable(),
-                cmd->shellArguments(QStringLiteral("cat /etc/resolv.conf 2>/dev/null || ipconfig /all")),
-                testGroupTimeoutSec(TestGroup::G3) * 1000);
-            DiagnosticResult res;
-            res.id = id;
-            res.group = TestGroup::G3;
-            res.status = r.isSuccess() ? TestStatus::Pass : TestStatus::Warning;
-            res.summary = QStringLiteral("DNS servers enumerated");
-            res.rawOutput = r.stdoutStr;
-            res.timestamp = QDateTime::currentDateTime();
-            return res;
-        }
-        case TestId::G3InternetConnectivity: {
-            // Ping 223.5.5.5 (Alibaba DNS) as connectivity check
-            ProcessResult r = cmd->runAndWait(cmd->shellExecutable(),
-                cmd->shellArguments(QStringLiteral("ping -c 4 -W 3 223.5.5.5 2>/dev/null || ping -n 4 -w 3000 223.5.5.5")),
-                15000);
-            DiagnosticResult res;
-            res.id = id;
-            res.group = TestGroup::G3;
-            auto pingResult = PingParser::parse(r.stdoutStr);
-            res.status = (r.isSuccess() && pingResult.lossPercent < 5.0) ? TestStatus::Pass : TestStatus::Warning;
-            res.summary = pingResult.lossPercent < 5.0
-                ? QStringLiteral("Internet reachable (loss %1%)").arg(pingResult.lossPercent, 0, 'f', 1)
-                : QStringLiteral("Packet loss %1%").arg(pingResult.lossPercent, 0, 'f', 1);
-            res.rawOutput = r.stdoutStr;
-            res.timestamp = QDateTime::currentDateTime();
-            return res;
-        }
-        default: {
-            // DnsCache, DnsPollution, SpeedTest — native plugin or G5-like HTTP (Phase 4)
-            return DiagnosticResult::skipped(id, QStringLiteral("Runs via native plugin or G5 handler"));
-        }
+        case DiagId::G3NetskopeStatus:        return G1G2G3Native::netskopeStatus(id);
+        case DiagId::G3DnsServers:            return G1G2G3Native::dnsServers(id);
+        case DiagId::G3DnsCache:              return G1G2G3Native::dnsCache(id);
+        case DiagId::G3DnsPollution:          return G1G2G3Native::dnsPollution(id);
+        case DiagId::G3InternetConnectivity:  return G1G2G3Native::speedTest(id); // merged
+        case DiagId::G3InternetSpeedTest:     return G1G2G3Native::speedTest(id);
+        default:
+            return DiagnosticResult::skipped(id, QStringLiteral("Unknown G3 test"));
     }
 }
 
 // ── G4: Remote Host ────────────────────────────────────────────────────────
 
-DiagnosticResult DiagnosticEngine::runG4(TestId id, const QString& target,
+DiagnosticResult DiagnosticEngine::runG4(DiagId id, const QString& target,
                                             int fromPort, int toPort, bool useCommonPorts) {
-    auto* cmd = m_cmd.get();
     switch (id) {
-        case TestId::G4DnsResolution: return G4RemoteHost::dnsResolution(target, cmd);
-        case TestId::G4Ping:          return G4RemoteHost::ping(target, cmd);
-        case TestId::G4Traceroute:    return G4RemoteHost::traceroute(target, cmd);
-        case TestId::G4PathPing:      return G4RemoteHost::pathPing(target, cmd);
-        case TestId::G4MtuDiscovery:  return G4RemoteHost::mtuDiscovery(target, cmd);
-        case TestId::G4PortScan: {
-            auto commonPorts = useCommonPorts
-                ? NetworkProbe::commonDiagnosticPorts()
-                : QVector<int>{};
-            QElapsedTimer t; t.start();
-            auto results = NetworkProbe::portScan(target, commonPorts, fromPort, toPort, 2000, 20);
-            DiagnosticResult r;
-            r.id = id; r.group = TestGroup::G4;
-            r.durationMs = t.elapsed(); r.timestamp = QDateTime::currentDateTime();
-            int openCount = 0;
-            for (const auto& e : results) {
-                if (e.open) {
-                    ++openCount;
-                    r.properties.append({QStringLiteral("Port %1").arg(e.port), "OPEN"});
+        case DiagId::G4DnsResolution: return G4RemoteHost::dnsResolution(target);
+        case DiagId::G4Ping:          return G4RemoteHost::ping(target);
+        case DiagId::G4Traceroute:    return G4RemoteHost::traceroute(target);
+        case DiagId::G4PathPing:      return G4RemoteHost::pathPing(target);
+        case DiagId::G4MtuDiscovery:  return G4RemoteHost::mtuDiscovery(target);
+        case DiagId::G4PortScan: {
+            // Build port list
+            QVector<int> portsToScan;
+            if (useCommonPorts)
+                portsToScan = NetworkProbe::commonDiagnosticPorts();
+            if (fromPort > 0 && toPort >= fromPort) {
+                fromPort = qBound(1, fromPort, 65535);
+                toPort = qBound(fromPort, toPort, 65535);
+                for (int p = fromPort; p <= toPort; ++p)
+                    if (!portsToScan.contains(p))
+                        portsToScan.append(p);
+            }
+            std::sort(portsToScan.begin(), portsToScan.end());
+
+            // Extract hostname from URL target (e.g. "https://example.com" → "example.com")
+            QString scanHost = target;
+            if (scanHost.contains("://")) {
+                scanHost = scanHost.section("://", 1);
+                int slash = scanHost.indexOf('/');
+                if (slash >= 0) scanHost = scanHost.left(slash);
+                if (scanHost.startsWith('[')) {
+                    int cb = scanHost.indexOf(']');
+                    if (cb > 0) scanHost = scanHost.mid(1, cb - 1);
+                } else {
+                    int colon = scanHost.lastIndexOf(':');
+                    if (colon > 0) scanHost = scanHost.left(colon);
                 }
             }
+
+            QElapsedTimer t; t.start();
+            auto results = NetworkProbe::portScan(scanHost, portsToScan, 2000, 64);
+            DiagnosticResult r;
+            r.id = id; r.group = DiagGroup::G4;
+            r.durationMs = t.elapsed(); r.timestamp = QDateTime::currentDateTime();
+
+            // ── Build merged-range output ──────────────────────────────
+            int openCount = 0, closedCount = 0;
+            QStringList namedOpen; // e.g. "22(ssh)"
+
+            for (const auto& e : results) {
+                if (e.open) { openCount++; }
+                else { closedCount++; }
+            }
+
+            // ── Merge consecutive same-status ports into ranges ─────────
+            int rangeStart = -1, rangeEnd = -1;
+            bool rangeOpen = false;
+            QStringList rangeLines;
+            QMap<int, QString> portSvcMap; // port → service name for named ports
+
+            for (const auto& e : results) {
+                if (!e.serviceName.isEmpty()) portSvcMap[e.port] = e.serviceName;
+            }
+
+            auto flushRange = [&]() {
+                if (rangeStart < 0) return;
+                QString status = rangeOpen ? QStringLiteral("OPENED") : QStringLiteral("CLOSED");
+                QString portStr;
+                if (rangeStart == rangeEnd)
+                    portStr = QString::number(rangeStart);
+                else
+                    portStr = QStringLiteral("%1-%2").arg(rangeStart).arg(rangeEnd);
+                rangeLines.append(QStringLiteral("  %1  %2")
+                    .arg(portStr, -19).arg(status));
+                // Collect for summary: single ports or ranges with service names
+                if (rangeOpen) {
+                    if (rangeStart == rangeEnd) {
+                        // Single open port
+                        if (portSvcMap.contains(rangeStart))
+                            namedOpen.append(QStringLiteral("%1(%2)").arg(rangeStart).arg(portSvcMap[rangeStart]));
+                        else
+                            namedOpen.append(QString::number(rangeStart));
+                    } else if (rangeEnd - rangeStart <= 2) {
+                        // 2-3 ports: list individually
+                        for (int p = rangeStart; p <= rangeEnd; p++) {
+                            if (portSvcMap.contains(p))
+                                namedOpen.append(QStringLiteral("%1(%2)").arg(p).arg(portSvcMap[p]));
+                            else
+                                namedOpen.append(QString::number(p));
+                        }
+                    } else {
+                        // 4+ consecutive: show range
+                        QString rng = QStringLiteral("%1-%2").arg(rangeStart).arg(rangeEnd);
+                        namedOpen.append(rng);
+                    }
+                }
+                rangeStart = -1;
+            };
+
+            for (const auto& e : results) {
+                bool isOpen = e.open;
+                if (rangeStart < 0) {
+                    rangeStart = rangeEnd = e.port;
+                    rangeOpen = isOpen;
+                } else if (e.port == rangeEnd + 1 && isOpen == rangeOpen) {
+                    rangeEnd = e.port;
+                } else {
+                    flushRange();
+                    rangeStart = rangeEnd = e.port;
+                    rangeOpen = isOpen;
+                }
+            }
+            flushRange();
+
+            // ── Raw output (merged range format) ────────────────────────
+            QStringList out;
+            out.append(QString());
+            out.append(QStringLiteral("Port Scan Results for %1").arg(scanHost));
+            out.append(QStringLiteral("Port range   Status"));
+            out.append(QStringLiteral("------------  ----------"));
+            for (const auto& line : rangeLines)
+                out.append(line);
+            out.append(QString());
+            r.rawOutput = out.join('\n');
+            r.details = out.join('\n');
+
+            // ── Summary: "18 ports closed, 1-3 opened, 22(ssh)" ─────────
+            QStringList parts;
+            if (closedCount > 0)
+                parts.append(QStringLiteral("%1 ports closed").arg(closedCount));
+            if (openCount > 0)
+                parts.append(QStringLiteral("%1 ports opened").arg(openCount));
+            if (!namedOpen.isEmpty())
+                parts.append(namedOpen.join(QStringLiteral(", ")));
+            r.summary = parts.join(QStringLiteral(", "));
             r.status = openCount > 0 ? TestStatus::Pass : TestStatus::Info;
-            r.summary = QStringLiteral("%1 ports open").arg(openCount);
             return r;
         }
         default:
@@ -253,21 +261,21 @@ DiagnosticResult DiagnosticEngine::runG4(TestId id, const QString& target,
 
 // ── G5: Website / URL ──────────────────────────────────────────────────────
 
-DiagnosticResult DiagnosticEngine::runG5(TestId id, const QString& target) {
+DiagnosticResult DiagnosticEngine::runG5(DiagId id, const QString& target) {
     switch (id) {
-        case TestId::G5UrlParsing:      return G5WebsiteUrl::urlParsing(target);
-        case TestId::G5TcpConnect:      return G5WebsiteUrl::tcpConnect(target);
-        case TestId::G5ServiceBanner:   return G5WebsiteUrl::serviceBanner(target);
-        case TestId::G5CurlVerbose:     return G5WebsiteUrl::curlVerbose(target);
-        case TestId::G5HttpHeaders:     return G5WebsiteUrl::httpHeaders(target);
-        case TestId::G5SecurityHeaders: return G5WebsiteUrl::securityHeaders(target);
-        case TestId::G5SslCertificate:  return G5WebsiteUrl::sslCertificate(target);
-        case TestId::G5HttpRedirect:    return G5WebsiteUrl::httpRedirect(target);
-        case TestId::G5HttpCompression: return G5WebsiteUrl::httpCompression(target);
-        case TestId::G5HttpTiming:      return G5WebsiteUrl::httpTiming(target);
-        case TestId::G5FtpDiagnostics:  return G5WebsiteUrl::ftpDiagnostics(target);
-        case TestId::G5SshDiagnostics:  return G5WebsiteUrl::sshDiagnostics(target);
-        case TestId::G5EmailDiagnostics:return G5WebsiteUrl::emailDiagnostics(target);
+        case DiagId::G5UrlParsing:      return G5WebsiteUrl::urlParsing(target);
+        case DiagId::G5TcpConnect:      return G5WebsiteUrl::tcpConnect(target);
+        case DiagId::G5ServiceBanner:   return G5WebsiteUrl::serviceBanner(target);
+        case DiagId::G5CurlVerbose:     return G5WebsiteUrl::curlVerbose(target);
+        case DiagId::G5HttpHeaders:     return G5WebsiteUrl::httpHeaders(target);
+        case DiagId::G5SecurityHeaders: return G5WebsiteUrl::securityHeaders(target);
+        case DiagId::G5SslCertificate:  return G5WebsiteUrl::sslCertificate(target);
+        case DiagId::G5HttpRedirect:    return G5WebsiteUrl::httpRedirect(target);
+        case DiagId::G5HttpCompression: return G5WebsiteUrl::httpCompression(target);
+        case DiagId::G5HttpTiming:      return G5WebsiteUrl::httpTiming(target);
+        case DiagId::G5FtpDiagnostics:  return G5WebsiteUrl::ftpDiagnostics(target);
+        case DiagId::G5SshDiagnostics:  return G5WebsiteUrl::sshDiagnostics(target);
+        case DiagId::G5EmailDiagnostics:return G5WebsiteUrl::emailDiagnostics(target);
         default:
             return DiagnosticResult::skipped(id, QStringLiteral("Unknown G5 test"));
     }

@@ -1,4 +1,5 @@
 import QtQuick
+import "../theme"
 import QtQuick.Controls
 import QtQuick.Layouts
 
@@ -14,26 +15,25 @@ Rectangle {
     color: "#16213E"
     border { width: 1; color: isRunning ? Qt.alpha("#00BCD4", 0.4) : "#2A2A4A" }
 
-    // ── Computed state ────────────────────────────────────────────────
+    // ── Computed state — all from C++ groupStats (single source of truth) ──
     property var allItems: { let _v = appState.resultsVersion; return appState.allTestsForGroup(groupIndex) }
-    property int enabledCount: { let _v = _modelVersion; var c=0; for(var i=0;i<allItems.length;i++)c++;return c }
-    property int completedCount: { let _v = _modelVersion; var c=0; for(var i=0;i<allItems.length;i++)if(allItems[i].isDone)c++;return c }
+    property int enabledCount: { let _v = _modelVersion; var s=appState.groupStats(groupIndex); return s.total||0 }
+    property int completedCount: { let _v = _modelVersion; var s=appState.groupStats(groupIndex); return s.completed||0 }
     property bool isRunning: appState.runStatus===1 && completedCount<enabledCount && completedCount>0
-    property int groupPass: { let _v = _modelVersion; var c=0; for(var i=0;i<allItems.length;i++)if(allItems[i].isDone&&allItems[i].status===0)c++;return c }
-    property int groupWarn: { let _v = _modelVersion; var c=0; for(var i=0;i<allItems.length;i++)if(allItems[i].isDone&&allItems[i].status===1)c++;return c }
-    property int groupFail: { let _v = _modelVersion; var c=0; for(var i=0;i<allItems.length;i++)if(allItems[i].isDone&&allItems[i].status===2)c++;return c }
-    property int groupSkip: { let _v = _modelVersion; var c=0; for(var i=0;i<allItems.length;i++)if(allItems[i].isDone&&allItems[i].status===3)c++;return c }
+    property int groupPass: { let _v = _modelVersion; var s=appState.groupStats(groupIndex); return s.pass||0 }
+    property int groupWarn: { let _v = _modelVersion; var s=appState.groupStats(groupIndex); return s.warn||0 }
+    property int groupFail: { let _v = _modelVersion; var s=appState.groupStats(groupIndex); return s.fail||0 }
+    property int groupSkip: { let _v = _modelVersion; var s=appState.groupStats(groupIndex); return s.skip||0 }
 
     onIsRunningChanged: if(!_userToggled)expanded=isRunning||completedCount>0
     onCompletedCountChanged: if(!_userToggled&&completedCount>0)expanded=true
 
-    Timer {
-        id: pollTimer
-        interval: 300
-        running: true
-        repeat: true
-        onTriggered: reloadModel()
+    // Watch parent DiagnosticScreen for model refresh — reload on each completed test
+    Connections {
+        target: page
+        function on_TotalCompletedChanged() { reloadModel() }
     }
+
     property int _modelVersion: 0
     property var itemsModel: []
     function reloadModel() {
@@ -56,15 +56,15 @@ Rectangle {
             spacing: 8
             Rectangle { width:3; height:24; radius:2; color:isRunning?"#00BCD4":"#0078D4" }
             ColumnLayout { spacing:1
-                Label { text:"G"+(groupIndex+1)+": "+(appState.groupLabels[groupIndex]||""); font.family:"JetBrains Mono"; font.pixelSize:13; font.weight:Font.DemiBold; color:"#E0E0E0" }
-                Label { visible:isRunning; text:"Running: "+(appState.currentTestLabel||"")+"..."; font.family:"JetBrains Mono"; font.pixelSize:10; font.italic:true; color:"#00BCD4"; elide:Text.ElideRight }
+                Label { text:"G"+(groupIndex+1)+": "+(Tr.groupName(groupIndex)); font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:13; font.weight:Font.DemiBold; color:"#E0E0E0" }
+                Label { visible:isRunning; text:"Running: "+(appState.currentTestLabel||"")+"..."; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:10; font.italic:true; color:"#00BCD4"; elide:Text.ElideRight }
             }
             Item { Layout.fillWidth:true }
-            Label { visible:isRunning||completedCount>0; text:completedCount+"/"+enabledCount; font.family:"JetBrains Mono"; font.pixelSize:11; font.weight:Font.Medium; color:"#A0A0B8" }
-            Rectangle { visible:groupPass>0; implicitWidth:26; implicitHeight:18; radius:4; color:Qt.alpha("#4ADE80",0.15); Label { anchors.centerIn:parent; text:groupPass; font.family:"JetBrains Mono"; font.pixelSize:10; color:"#4ADE80"; font.weight:Font.Bold } }
-            Rectangle { visible:groupWarn>0; implicitWidth:26; implicitHeight:18; radius:4; color:Qt.alpha("#FACC15",0.15); Label { anchors.centerIn:parent; text:groupWarn; font.family:"JetBrains Mono"; font.pixelSize:10; color:"#FACC15"; font.weight:Font.Bold } }
-            Rectangle { visible:groupFail>0; implicitWidth:26; implicitHeight:18; radius:4; color:Qt.alpha("#EF4444",0.15); Label { anchors.centerIn:parent; text:groupFail; font.family:"JetBrains Mono"; font.pixelSize:10; color:"#EF4444"; font.weight:Font.Bold } }
-            Rectangle { visible:groupSkip>0; implicitWidth:26; implicitHeight:18; radius:4; color:Qt.alpha("#888888",0.15); Label { anchors.centerIn:parent; text:groupSkip; font.family:"JetBrains Mono"; font.pixelSize:10; color:"#888888"; font.weight:Font.Bold } }
+            Label { visible:isRunning||completedCount>0; text:completedCount+"/"+enabledCount; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:11; font.weight:Font.Medium; color:"#A0A0B8" }
+            Rectangle { visible:groupPass>0; implicitWidth:26; implicitHeight:18; radius:4; color:Qt.alpha("#4ADE80",0.15); Label { anchors.centerIn:parent; text:groupPass; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:10; color:"#4ADE80"; font.weight:Font.Bold } }
+            Rectangle { visible:groupWarn>0; implicitWidth:26; implicitHeight:18; radius:4; color:Qt.alpha("#FACC15",0.15); Label { anchors.centerIn:parent; text:groupWarn; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:10; color:"#FACC15"; font.weight:Font.Bold } }
+            Rectangle { visible:groupFail>0; implicitWidth:26; implicitHeight:18; radius:4; color:Qt.alpha("#EF4444",0.15); Label { anchors.centerIn:parent; text:groupFail; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:10; color:"#EF4444"; font.weight:Font.Bold } }
+            Rectangle { visible:groupSkip>0; implicitWidth:26; implicitHeight:18; radius:4; color:Qt.alpha("#888888",0.15); Label { anchors.centerIn:parent; text:groupSkip; font.family:"JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize:10; color:"#888888"; font.weight:Font.Bold } }
             Label { text:expanded?"▼":"▶"; font.pixelSize:10; color:"#A0A0B8" }
         }
 

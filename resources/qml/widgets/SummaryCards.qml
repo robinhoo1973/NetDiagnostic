@@ -1,67 +1,68 @@
 import QtQuick
+import "../theme"
 import QtQuick.Controls
 import QtQuick.Layouts
 
-// ── Flutter SummaryCards — 2x2 grid with icons (matching Flutter) ─────
+// ── SummaryCards — shared data, one row per category ─────────────────
 ColumnLayout {
     id: summaryRoot
     spacing: 0
-    property int pass: 0; property int warn: 0; property int fail: 0; property int skip: 0
+    property int pass: 0; property int warn: 0; property int fail: 0; property int skip: 0; property int info: 0
+    property bool compact: false
 
-    // Header: "Summary" + "Total: N" (Flutter: fontSize 11/10, w600, letterSpacing 0.6)
+    // Header: "Summary" + "Total: N"
     RowLayout {
-        Label { Layout.fillWidth: true; text: "Summary"; font.family: "JetBrains Mono"; font.pixelSize: 11; font.weight: Font.DemiBold; color: Theme.textSecondary }
-        Label { text: "Total: " + (pass+warn+fail+skip); font.family: "JetBrains Mono"; font.pixelSize: 10; color: Theme.textSecondary }
-    }
-    Item { Layout.preferredHeight: 8 }
-
-    // Row 1: Pass + Warning
-    RowLayout { spacing: 6
-        SummaryCard { Layout.fillWidth: true; accent: Theme.passGreen;  label: "Pass";    count: summaryRoot.pass }
-        SummaryCard { Layout.fillWidth: true; accent: Theme.warnYellow; label: "Warning"; count: summaryRoot.warn }
+        Label { Layout.fillWidth: true; text: Tr.summary; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 11; font.weight: Font.DemiBold; color: Theme.textSecondary }
+        Label { text: Tr.totalTestsLabel + (pass+warn+fail+skip+info); font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; color: Theme.textSecondary }
     }
     Item { Layout.preferredHeight: 6 }
-    // Row 2: Fail + Skipped
-    RowLayout { spacing: 6
-        SummaryCard { Layout.fillWidth: true; accent: Theme.failRed;  label: "Fail";    count: summaryRoot.fail }
-        SummaryCard { Layout.fillWidth: true; accent: Theme.skipGray; label: "Skipped"; count: summaryRoot.skip }
-    }
+
+    SummaryCard { Layout.fillWidth: true; accent: Theme.passGreen;  label: Tr.summaryPass;    count: summaryRoot.pass;  rightAlign: summaryRoot.compact }
+    SummaryCard { Layout.fillWidth: true; accent: Theme.accentBlue;label: Tr.summaryInfo;    count: summaryRoot.info;  rightAlign: summaryRoot.compact }
+    SummaryCard { Layout.fillWidth: true; accent: Theme.warnYellow; label: Tr.summaryWarning; count: summaryRoot.warn;  rightAlign: summaryRoot.compact }
+    SummaryCard { Layout.fillWidth: true; accent: Theme.failRed;   label: Tr.summaryFail;    count: summaryRoot.fail;  rightAlign: summaryRoot.compact }
+    SummaryCard { Layout.fillWidth: true; accent: Theme.skipGray;  label: Tr.summarySkipped; count: summaryRoot.skip;  rightAlign: summaryRoot.compact }
 
     Connections {
         target: appState
         function onProgressChanged() { refresh() }
         function onTestCompleted() { refresh() }
-        function onResultsReset() { pass=warn=fail=skip=0 }
+        function onResultsReset() { pass=warn=fail=skip=info=0 }
     }
     Component.onCompleted: refresh()
     function refresh() {
-        pass=0; warn=0; fail=0; skip=0
+        pass=0; warn=0; fail=0; skip=0; info=0
         for (var g=0; g<appState.groupLabels.length; g++) {
             var s = appState.groupStats(g)
-            pass += s.pass; warn += s.warn; fail += s.fail; skip += s.skip
+            pass += s.pass; warn += s.warn; fail += s.fail; skip += s.skip; info += (s.info||0)
         }
     }
 
-    // Flutter _SummaryCard: padding h10 v10, borderRadius 8, icon 20px + count 20/w700 + label 9/w500
     component SummaryCard: Rectangle {
         property color accent: Theme.passGreen
         property string label: ""
         property int count: 0
-        implicitHeight: 46; radius: 8
-        color: Qt.alpha(accent, 0.08)
-        border { width: 1; color: Qt.alpha(accent, 0.25) }
+        property bool rightAlign: false
+        implicitHeight: 32; radius: 6; Layout.topMargin: 2
+        color: Qt.alpha(accent, 0.06)
+        border { width: 1; color: Qt.alpha(accent, 0.2) }
 
         RowLayout {
-            anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
-            // Flutter: Icon(icon, size: 20, color: color) — use AppIcon with matching names
+            anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
             AppIcon {
-                name: label === "Pass" ? "check" : (label === "Warning" ? "warning" : (label === "Fail" ? "error" : (label === "Skipped" ? "circle" : "info")))
-                size: 20; color: accent
+                name: label === "Pass" ? "badge-check" : (label === "Warning" ? "badge-warning" : (label === "Fail" ? "badge-close" : (label === "Skipped" ? "badge-skip" : "badge-info")))
+                size: 14; color: accent
+            }
+            Item { Layout.fillWidth: true }
+            Label {
+                text: label; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 10; font.weight: Font.Medium
+                color: Qt.alpha(Theme.textSecondary, 0.8)
             }
             Item { width: 8 }
-            ColumnLayout { spacing: 1
-                Label { text: count; font.family: "JetBrains Mono"; font.pixelSize: 20; font.weight: Font.Bold; color: accent }
-                Label { text: label; font.family: "JetBrains Mono"; font.pixelSize: 9; font.weight: Font.Medium; color: Qt.alpha(Theme.textSecondary, 0.8) }
+            Label {
+                text: ("   " + count).slice(-3)
+                font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 16; font.weight: Font.Bold; color: accent
+                horizontalAlignment: Text.AlignRight
             }
         }
     }

@@ -27,3 +27,10 @@ Makefile
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Logs
+*.log
+
+# External binaries (not part of project)
+codewhale
+codewhale-tui

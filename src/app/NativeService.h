@@ -1,38 +1,32 @@
 // =============================================================================
-// NativeService.h — Direct C++ wrapper around the nd_plugin native diagnostics
-//
-// Calls nd_init/nd_run_diagnostic/nd_free_result directly from C++.
+// NativeService.h — Stub: native plugin removed, all diagnostics use C++ fallbacks
 // =============================================================================
 #pragma once
 
 #include <QString>
 #include <optional>
-#include "models/TestId.h"
+#include "models/DiagId.h"
 #include "models/DiagnosticResult.h"
-#include "nd_types.h"
 
 class NativeService {
 public:
     static NativeService& instance();
 
-    /// Initialize the native plugin. Returns false on failure.
+    /// Always returns false — native plugin is disabled.
     bool initialize();
 
-    /// Shut down and free resources.
     void shutdown();
 
-    /// Whether the plugin loaded successfully.
-    bool isAvailable() const { return m_available; }
+    /// Always returns false — native plugin is disabled.
+    bool isAvailable() const { return false; }
 
-    /// Does the native plugin support this test?
-    bool isNativeCapable(TestId id) const;
+    /// Always returns false — never route to native.
+    bool isNativeCapable(DiagId id) const;
 
-    /// Run a diagnostic via the native plugin.
-    /// Returns nullopt if plugin unavailable or test not supported.
-    std::optional<DiagnosticResult> runDiagnostic(TestId id, const QString& target = {},
+    /// Always returns nullopt — all tests use C++ fallback.
+    std::optional<DiagnosticResult> runDiagnostic(DiagId id, const QString& target = {},
                                                    int fromPort = 0, int toPort = 0);
 
-    /// Get the native plugin version string.
     QString version() const { return m_version; }
 
 private:
@@ -41,6 +35,8 @@ private:
     NativeService(const NativeService&) = delete;
     NativeService& operator=(const NativeService&) = delete;
 
+    // Incomplete type forward — mapResult is never called (stub)
+    struct NdDiagnosticResult;
     DiagnosticResult mapResult(const NdDiagnosticResult* nr) const;
 
     bool m_available = false;

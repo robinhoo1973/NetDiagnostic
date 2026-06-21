@@ -3,7 +3,7 @@
 // =============================================================================
 #include "models/DiagnosticResult.h"
 
-DiagnosticResult DiagnosticResult::skipped(TestId id, const QString& reason) {
+DiagnosticResult DiagnosticResult::skipped(DiagId id, const QString& reason) {
     DiagnosticResult r;
     r.id = id;
     r.group = testGroup(id);
@@ -13,7 +13,7 @@ DiagnosticResult DiagnosticResult::skipped(TestId id, const QString& reason) {
     return r;
 }
 
-DiagnosticResult DiagnosticResult::error(TestId id, const QString& msg) {
+DiagnosticResult DiagnosticResult::error(DiagId id, const QString& msg) {
     DiagnosticResult r;
     r.id = id;
     r.group = testGroup(id);
@@ -24,7 +24,7 @@ DiagnosticResult DiagnosticResult::error(TestId id, const QString& msg) {
     return r;
 }
 
-DiagnosticResult DiagnosticResult::timeout(TestId id, TestGroup group, qint64 durationMs) {
+DiagnosticResult DiagnosticResult::timeout(DiagId id, DiagGroup group, qint64 durationMs) {
     DiagnosticResult r;
     r.id = id;
     r.group = group;

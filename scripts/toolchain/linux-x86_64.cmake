@@ -15,5 +15,7 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
-# Prefer pkg-config from the target sysroot
 set(PKG_CONFIG_EXECUTABLE /usr/bin/x86_64-linux-gnu-pkg-config CACHE FILEPATH "pkg-config for target")
+
+# ── Static linking hints ─────────────────────────────────────────────────
+set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++" CACHE STRING "")

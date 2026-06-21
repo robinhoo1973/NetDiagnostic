@@ -1,19 +1,79 @@
-# 构建脚本
+#!/usr/bin/env bash
+# =============================================================================
+# rebuild.sh — Quick native rebuild for development
+#
+# Builds Release binaries for the current host architecture.
+# Output: dist/net_diagnostic-<os>-<arch>
+#         dist/net_diagnostic_sim-<os>-<arch>
+#
+# Usage: ./rebuild.sh [clean]
+# =============================================================================
+set -euo pipefail
 
-# 强制重新生成 QRC 文件
-find resources/ -type f -exec touch {} +
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUILD_DIR="${TMPDIR:-/tmp}/netdiag-rebuild"
+DIST_DIR="${TMPDIR:-/tmp}/netdiag-dist"
+JOBS="$(nproc 2>/dev/null || echo 4)"
 
-# 构建
-cd /tmp/netdiag-build/build
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_TESTS=OFF -DBUILD_SIMULATOR=ON \
-    -B . -S "/home/radxa/thinclient_drives/C:/Users/HUJ9/OneDrive - Otis Global Tenant/PowerShell/NetDiagnostic-QT"
-ninja net_diagnostic net_diagnostic_sim
+# ── OS/arch detection ──────────────────────────────────────────────────────
+case "$(uname -s)" in
+    Linux)  HOST_OS="Linux" ;;
+    Darwin) HOST_OS="macOS" ;;
+    MINGW*|MSYS*) HOST_OS="Windows" ;;
+    *)      HOST_OS="$(uname -s)" ;;
+esac
+HOST_ARCH="$(uname -m)"
+[[ "$HOST_ARCH" == "x86_64" ]] && HOST_ARCH="x86_64"
+[[ "$HOST_ARCH" == "aarch64" ]] && HOST_ARCH="arm64"
 
-# 复制
-cp net_diagnostic "/home/radxa/thinclient_drives/C:/Users/HUJ9/OneDrive - Otis Global Tenant/PowerShell/NetDiagnostic-QT/dist/net_diagnostic-Linux-arm64"
-cp net_diagnostic_sim "/home/radxa/thinclient_drives/C:/Users/HUJ9/OneDrive - Otis Global Tenant/PowerShell/NetDiagnostic-QT/dist/net_diagnostic_sim-Linux-arm64"
+echo "=== Native rebuild: ${HOST_OS}-${HOST_ARCH} ==="
 
-echo "构建完成！"
-echo "运行: ./dist/net_diagnostic-Linux-arm64"
-echo "模拟器: ./dist/net_diagnostic_sim-Linux-arm64"
+[[ "${1:-}" == "clean" ]] && rm -rf "$BUILD_DIR"
+
+mkdir -p "$BUILD_DIR" "$DIST_DIR"
+
+# ── CMake Configure ────────────────────────────────────────────────────────
+# Use arch-specific toolchain if available (sets -march and static flags)
+TC_FILE=""
+case "$HOST_ARCH" in
+    arm64)  [[ -f "$PROJECT_DIR/scripts/toolchain/linux-arm64.cmake" ]] && TC_FILE="$PROJECT_DIR/scripts/toolchain/linux-arm64.cmake" ;;
+    x86_64) [[ -f "$PROJECT_DIR/scripts/toolchain/linux-x86_64.cmake" ]] && TC_FILE="$PROJECT_DIR/scripts/toolchain/linux-x86_64.cmake" ;;
+esac
+
+CMAKE_ARGS=(
+    -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    -DBUILD_TESTS=OFF
+    -DBUILD_SIMULATOR=ON
+)
+[[ -n "$TC_FILE" ]] && CMAKE_ARGS+=(-DCMAKE_TOOLCHAIN_FILE="$TC_FILE")
+
+cmake "${CMAKE_ARGS[@]}" -B "$BUILD_DIR" -S "$PROJECT_DIR" || {
+    echo "ERROR: CMake configure failed"
+    exit 1
+}
+
+# ── Build ──────────────────────────────────────────────────────────────────
+ninja -C "$BUILD_DIR" net_diagnostic net_diagnostic_sim -j"$JOBS" || {
+    echo "ERROR: Build failed"
+    exit 1
+}
+
+# ── Copy outputs ───────────────────────────────────────────────────────────
+BIN="$BUILD_DIR/net_diagnostic"
+SIM="$BUILD_DIR/net_diagnostic_sim"
+EXT=""
+[[ "$HOST_OS" == "Windows" ]] && EXT=".exe"
+
+cp "$BIN" "$DIST_DIR/net_diagnostic-${HOST_OS}-${HOST_ARCH}${EXT}" 2>/dev/null || {
+    echo "ERROR: net_diagnostic binary not found at $BIN"
+    exit 1
+}
+cp "$SIM" "$DIST_DIR/net_diagnostic_sim-${HOST_OS}-${HOST_ARCH}${EXT}" 2>/dev/null || true
+
+echo ""
+echo "Build complete:"
+ls -lh "$DIST_DIR"/net_diagnostic* 2>/dev/null
+echo ""
+echo "Run: $DIST_DIR/net_diagnostic-${HOST_OS}-${HOST_ARCH}${EXT}"

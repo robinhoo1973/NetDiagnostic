@@ -1,4 +1,5 @@
 import QtQuick
+import "../theme"
 import QtQuick.Controls
 import QtQuick.Layouts
 import "../widgets"
@@ -8,10 +9,17 @@ Item {
     id: page
     objectName: "config"
     property int currentGroup: 0
+    property int _cachedConfigGen: -1
     property int configPollVersion: 0
     Timer {
         interval: 300; running: true; repeat: true
-        onTriggered: { configPollVersion++ }
+        onTriggered: {
+            var v = appState.stateVersion
+            if (v !== _cachedConfigGen) {
+                _cachedConfigGen = v
+                configPollVersion++
+            }
+        }
     }
 
     // AppBar
@@ -27,7 +35,7 @@ Item {
                 anchors { leftMargin: 16; rightMargin: 16 }
                 AppIcon { name: "config"; size: 20; color: Theme.cyan }
                 Item { width: 10 }
-                Label { text: "Test Configuration"; font.family: "JetBrains Mono"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
+                Label { text: Tr.testConfig; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 15; font.weight: Font.DemiBold; color: Theme.textPrimary }
             }
             // TabBar — Flutter: G1..G5 tabs
             Rectangle {
@@ -49,7 +57,7 @@ Item {
                             contentItem: Label {
                                 anchors.centerIn: parent
                                 text: "G" + (index + 1)
-                                font.family: "JetBrains Mono"; font.pixelSize: 12
+                                font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 12
                                 font.weight: index === currentGroup ? Font.DemiBold : Font.Normal
                                 color: index === currentGroup ? Theme.cyan : Theme.textSecondary
                             }
@@ -74,12 +82,12 @@ Item {
                 anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
                 ColumnLayout { spacing: 2
                     Label {
-                        text: appState.groupLabels[currentGroup] || ""
-                        font.family: "JetBrains Mono"; font.pixelSize: 14; font.weight: Font.DemiBold; color: Theme.textPrimary
+                        text: Tr.groupName(currentGroup)
+                        font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 14; font.weight: Font.DemiBold; color: Theme.textPrimary
                     }
                     Label {
-                        text: getTestCountForGroup(currentGroup) + " tests"
-                        font.family: "JetBrains Mono"; font.pixelSize: 11; color: Theme.textSecondary
+                        text: getTestCountForGroup(currentGroup) + Tr.testsSuffix
+                        font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 11; color: Theme.textSecondary
                     }
                 }
                 Item { Layout.fillWidth: true }
@@ -91,7 +99,7 @@ Item {
                     opacity: enabled ? 1.0 : 0.4
                     RowLayout { anchors.centerIn: parent; spacing: 4
                         AppIcon { name: "check"; size: 14; color: Theme.textPrimary }
-                        Label { text: "Select All"; font.family: "JetBrains Mono"; font.pixelSize: 11; color: Theme.textPrimary }
+                        Label { text: Tr.selectAll; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 11; color: Theme.textPrimary }
                     }
                     MouseArea {
                         anchors.fill: parent
@@ -108,7 +116,7 @@ Item {
                     opacity: enabled ? 1.0 : 0.4
                     RowLayout { anchors.centerIn: parent; spacing: 4
                         AppIcon { name: "close"; size: 14; color: Theme.textPrimary }
-                        Label { text: "Deselect All"; font.family: "JetBrains Mono"; font.pixelSize: 11; color: Theme.textPrimary }
+                        Label { text: Tr.deselectAll; font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 11; color: Theme.textPrimary }
                     }
                     MouseArea {
                         anchors.fill: parent
@@ -122,7 +130,7 @@ Item {
         // ── Test list — Flutter: ListView.separated with SwitchListTile ─
         ListView {
             Layout.fillWidth: true; Layout.fillHeight: true; clip: true
-            model: appState.allTestIdsForGroup(currentGroup)
+            model: appState.allDiagIdsForGroup(currentGroup)
             delegate: ItemDelegate {
                 id: tile
                 width: ListView.view.width
@@ -139,11 +147,11 @@ Item {
                     anchors { fill: parent; leftMargin: 16; rightMargin: 16; topMargin: 8; bottomMargin: 8 }
                     spacing: 12
 
-                    // Leading icon — Flutter: check_circle / radio_button_unchecked
-                    Label {
-                        text: appState.isTestEnabled(modelData) ? "✓" : "○"
-                        font.pixelSize: 20
-                        color: appState.isTestEnabled(modelData) ? Theme.accentBlue : "#5A5A7A"
+                    // Leading icon
+                    AppIcon {
+                        name: appState.isTestEnabled(modelData) ? "badge-check" : "badge-circle"
+                        size: 14
+                        color: "white"
                     }
 
                     // Title + subtitle
@@ -152,13 +160,13 @@ Item {
                         Label {
                             Layout.fillWidth: true
                             text: getDisplayName(modelData)
-                            font.family: "JetBrains Mono"; font.pixelSize: 13; font.weight: Font.Medium; color: Theme.textPrimary
+                            font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 13; font.weight: Font.Medium; color: Theme.textPrimary
                             elide: Text.ElideRight
                         }
                         Label {
                             Layout.fillWidth: true
                             text: getTestDescription(modelData)
-                            font.family: "JetBrains Mono"; font.pixelSize: 11
+                            font.family: "JetBrains Mono, Noto Sans Mono CJK SC, Microsoft YaHei"; font.pixelSize: 11
                             color: Qt.alpha(Theme.textSecondary, 0.6)
                             elide: Text.ElideRight; maximumLineCount: 2
                             visible: text !== ""
@@ -178,65 +186,66 @@ Item {
         }
     }
 
-    // ── G1 description — from Flutter's staticTestName() ───────────────
+    // ── Display names + descriptions — routed through Tr.testName/testDesc ──
+    property var _enNames: ["Network Adapters","NIC Advanced","WiFi Information","Wired Information",
+        "DHCP Status","IP Configuration","Active Connections","Network Profile",
+        "TCP Settings","Default Gateway","Routing Table","ARP Table","Proxy Settings",
+        "Netskope Status","DNS Servers","DNS Cache","DNS Pollution",
+        "Internet Connectivity && Speed","Internet Connectivity && Speed","DNS Resolution","Ping","Traceroute",
+        "PathPing","MTU Discovery","Port Scan","URL Parsing","TCP Connect",
+        "Service Banner","HTTP Request","HTTP Headers","Security Headers",
+        "SSL Certificate","HTTP Redirect","HTTP Compression","HTTP Timing",
+        "FTP Diagnostics","SSH Diagnostics","Email Diagnostics"]
+    property var _enDescs: ["List all network adapters and their operational state",
+        "Driver version, hardware info, and negotiated link speed",
+        "Signal strength, SSID, channel, and link quality",
+        "Ethernet link status, speed, and duplex mode",
+        "DHCP lease info, server address, and expiration",
+        "IP addresses, subnet mask, default gateway, DNS servers",
+        "TCP/UDP connections: ESTABLISHED, LISTENING, etc.",
+        "Active network profile type (Domain/Private/Public)",
+        "TCP/IP stack parameters and configurations",
+        "Default gateway reachability and response time",
+        "IPv4 and IPv6 routing table entries",
+        "ARP cache entries for local network discovery",
+        "System proxy configuration and auto-detection",
+        "Netskope client status and connection health",
+        "Configured DNS servers and their responsiveness",
+        "DNS resolver cache entries and statistics",
+        "Check for DNS hijacking or spoofing indicators",
+        "Connectivity check + Speedtest.net bandwidth test",
+        "Connectivity check + Speedtest.net bandwidth test",
+        "Resolve target hostname to IP address(es)",
+        "TCP connect round-trip time and packet loss",
+        "Route path and per-hop latency to target",
+        "Combined traceroute and ping with per-hop loss",
+        "Path MTU discovery to target host",
+        "TCP port scan (common / custom range / both)",
+        "Parse and validate the target URL components",
+        "TCP connectivity check to the URL host on default port",
+        "Service banner detection for text-based protocols",
+        "HTTP request/response headers and timing",
+        "HTTP response headers from the target server",
+        "Security-related HTTP headers (HSTS, CSP, etc.)",
+        "SSL/TLS certificate chain and validity check",
+        "HTTP redirect chain and final destination",
+        "Supported compression methods and encoding",
+        "HTTP request timing breakdown (DNS, connect, SSL, etc.)",
+        "FTP service reachability and banner detection",
+        "SSH version and key exchange detection",
+        "SMTP/IMAP/POP3 service detection and banner"]
     function getDisplayName(testId) {
-        var names = [
-            "Network Adapters","NIC Advanced","WiFi Diagnostics","Wired Diagnostics",
-            "DHCP Status","IP Configuration","Active Connections","Network Profile",
-            "TCP Settings","Default Gateway","Routing Table","ARP Table","Proxy Settings",
-            "Netskope Status","DNS Servers","DNS Cache","DNS Pollution",
-            "Internet Connectivity","Speed Test","DNS Resolution","Ping","Traceroute",
-            "PathPing","MTU Discovery","Port Scan","URL Parsing","TCP Connect",
-            "Service Banner","HTTP Request","HTTP Headers","Security Headers",
-            "SSL Certificate","HTTP Redirect","HTTP Compression","HTTP Timing",
-            "FTP Diagnostics","SSH Diagnostics","Email Diagnostics"
-        ]
-        return (testId >= 0 && testId < names.length) ? names[testId] : "Test " + testId
+        // Use translated name when available (non-EN), fallback to English array
+        var tr = Tr.testName(testId)
+        if (tr !== "") return tr
+        return (testId >= 0 && testId < _enNames.length) ? _enNames[testId] : "Test " + testId
     }
     function getTestDescription(testId) {
-        var descs = [
-            "List all network adapters and their operational state",
-            "Driver version, hardware info, and negotiated link speed",
-            "Signal strength, SSID, channel, and link quality",
-            "Ethernet link status, speed, and duplex mode",
-            "DHCP lease info, server address, and expiration",
-            "IP addresses, subnet mask, default gateway, DNS servers",
-            "TCP/UDP connections: ESTABLISHED, LISTENING, etc.",
-            "Active network profile type (Domain/Private/Public)",
-            "TCP/IP stack parameters and configurations",
-            "Default gateway reachability and response time",
-            "IPv4 and IPv6 routing table entries",
-            "ARP cache entries for local network discovery",
-            "System proxy configuration and auto-detection",
-            "Netskope client status and connection health",
-            "Configured DNS servers and their responsiveness",
-            "DNS resolver cache entries and statistics",
-            "Check for DNS hijacking or spoofing indicators",
-            "End-to-end internet connectivity check",
-            "Download/upload speed and latency measurement",
-            "Resolve target hostname to IP address(es)",
-            "ICMP echo request round-trip time and loss",
-            "Route path and per-hop latency to target",
-            "Combined traceroute and ping with packet loss",
-            "Path MTU discovery to target host",
-            "TCP port scan (common / custom range / both)",
-            "Parse and validate the target URL components",
-            "TCP connectivity check to the URL host on default port",
-            "Service banner detection for text-based protocols",
-            "HTTP request/response headers and timing",
-            "HTTP response headers from the target server",
-            "Security-related HTTP headers (HSTS, CSP, etc.)",
-            "SSL/TLS certificate chain and validity check",
-            "HTTP redirect chain and final destination",
-            "Supported compression methods and encoding",
-            "HTTP request timing breakdown (DNS, connect, SSL, etc.)",
-            "FTP service reachability and banner detection",
-            "SSH version and key exchange detection",
-            "SMTP/IMAP/POP3 service detection and banner"
-        ]
-        return (testId >= 0 && testId < descs.length) ? descs[testId] : ""
+        var tr = Tr.testDesc(testId)
+        if (tr !== "") return tr
+        return (testId >= 0 && testId < _enDescs.length) ? _enDescs[testId] : ""
     }
     function getTestCountForGroup(groupIdx) {
-        return appState.allTestIdsForGroup(groupIdx).length
+        return appState.allDiagIdsForGroup(groupIdx).length
     }
 }

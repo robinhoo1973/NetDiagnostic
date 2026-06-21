@@ -2,7 +2,6 @@
 // AppState.cpp
 // =============================================================================
 #include "app/AppState.h"
-#include "engine/PlatformCommand.h"
 #include "engine/diagnostic/DiagnosticEngine.h"
 #include "app/NativeService.h"
 #include "util/Logger.h"
@@ -20,37 +19,37 @@
 
 AppState::AppState(QObject* parent) : QObject(parent) {
     // Enable G1-G3 by default; G4/G5 are auto-managed based on target
-    for (auto id : allTestIds()) {
+    for (auto id : allDiagIds()) {
         auto g = testGroup(id);
-        if (g == TestGroup::G1 || g == TestGroup::G2 || g == TestGroup::G3)
+        if (g == DiagGroup::G1 || g == DiagGroup::G2 || g == DiagGroup::G3)
             m_enabledTests.insert(id);
     }
 
-    auto cmd = createPlatformCommand();
-    m_engine = new DiagnosticEngine(std::move(cmd), this);
+    m_engine = new DiagnosticEngine(this);
 
     QObject::connect(m_engine, &DiagnosticEngine::destroyed, this, [this]() { m_engine = nullptr; });
-
-    // ARM64 workaround: C++ QTimer more reliable than QML Timers for polling
-    auto* pollTimer = new QTimer(this);
-    pollTimer->setInterval(200);
-    QObject::connect(pollTimer, &QTimer::timeout, this, [this]() {
-        // ARM64 workaround: periodically re-emit ALL NOTIFY signals so QML
-        // bindings that may have missed the original signal will re-evaluate.
-        emit progressChanged();
-        emit runStatusChanged();
-        emit targetChanged();
-        emit currentTestChanged();
-        emit groupChanged();
-        emit portScanConfigChanged();
-    });
-    pollTimer->start();
 }
 
 AppState::~AppState() {
     if (m_runStatus == RunStatus::Running) {
         m_runStatus = RunStatus::Cancelled;
     }
+}
+
+// ── State version — called at end of every mutation method ──────────────
+void AppState::bumpVersion() {
+    m_stateGeneration.fetch_add(1, std::memory_order_release);
+    emit stateVersionChanged();
+}
+
+// ── Language switching ──────────────────────────────────────────────────
+// 0=EN,1=FR,2=DE,3=RU,4=IT,5=ZH_CN,6=ZH_TW
+void AppState::setLanguage(int index) {
+    if (index < 0 || index > 6) return;
+    m_languageIndex = index;
+    emit languageChanged();
+    bumpVersion();
+    fprintf(stderr, "[TRACE] Language set to index %d\n", index);
 }
 
 // ── RFC 952/1123 hostname label validation ────────────────────────────────
@@ -201,13 +200,14 @@ void AppState::setTarget(const QString& t) {
         fprintf(stderr, "[TRACE] setTarget result: has=%d isUrl=%d isHttp=%d G4=%d G5=%d err='%s'\n",
                 has, isUrl, isHttp, has, has && isHttp, m_targetError.toUtf8().constData());
         emit targetChanged();
+        bumpVersion();
     }
 }
 
 // ── Port scan config ───────────────────────────────────────────────────────
-void AppState::setPortScanCommon(bool v) { if (m_portScanCommon != v) { m_portScanCommon = v; emit portScanConfigChanged(); } }
-void AppState::setPortScanFrom(int v) { if (m_portScanFrom != v) { m_portScanFrom = v; emit portScanConfigChanged(); } }
-void AppState::setPortScanTo(int v) { if (m_portScanTo != v) { m_portScanTo = v; emit portScanConfigChanged(); } }
+void AppState::setPortScanCommon(bool v) { if (m_portScanCommon != v) { m_portScanCommon = v; emit portScanConfigChanged(); bumpVersion(); } }
+void AppState::setPortScanFrom(int v) { if (m_portScanFrom != v) { m_portScanFrom = v; emit portScanConfigChanged(); bumpVersion(); } }
+void AppState::setPortScanTo(int v) { if (m_portScanTo != v) { m_portScanTo = v; emit portScanConfigChanged(); bumpVersion(); } }
 
 // ── Group labels ───────────────────────────────────────────────────────────
 QStringList AppState::groupLabels() const {
@@ -219,24 +219,25 @@ QStringList AppState::groupLabels() const {
 }
 
 // ── Test enable/disable ────────────────────────────────────────────────────
-static bool isValidTestId(int id) { return id >= 0 && id < 38; }
+static bool isValidDiagId(int id) { return id >= 0 && id < 38; }
 static bool isValidGroup(int g) { return g >= 0 && g < 5; }
 
 bool AppState::isTestEnabled(int testIdInt) const {
-    if (!isValidTestId(testIdInt)) return false;
-    return m_enabledTests.contains(static_cast<TestId>(testIdInt));
+    if (!isValidDiagId(testIdInt)) return false;
+    return m_enabledTests.contains(static_cast<DiagId>(testIdInt));
 }
 
 void AppState::setTestEnabled(int testIdInt, bool enabled) {
-    if (!isValidTestId(testIdInt)) return;
-    auto id = static_cast<TestId>(testIdInt);
+    if (!isValidDiagId(testIdInt)) return;
+    auto id = static_cast<DiagId>(testIdInt);
     if (enabled) m_enabledTests.insert(id);
     else m_enabledTests.remove(id);
+    bumpVersion();
 }
 
 void AppState::setGroupEnabled(int groupInt, bool enabled) {
     if (!isValidGroup(groupInt)) return;
-    auto g = static_cast<TestGroup>(groupInt);
+    auto g = static_cast<DiagGroup>(groupInt);
     fprintf(stderr, "[TRACE] setGroupEnabled G%d = %d (before: %d tests in set)\n",
             groupInt+1, enabled, (int)m_enabledTests.size());
     for (auto id : testIdsForGroup(g)) {
@@ -245,11 +246,12 @@ void AppState::setGroupEnabled(int groupInt, bool enabled) {
     }
     fprintf(stderr, "[TRACE] setGroupEnabled G%d = %d (after: %d tests in set)\n",
             groupInt+1, enabled, (int)m_enabledTests.size());
+    bumpVersion();
 }
 
 bool AppState::isGroupAllEnabled(int groupInt) const {
     if (!isValidGroup(groupInt)) return false;
-    auto g = static_cast<TestGroup>(groupInt);
+    auto g = static_cast<DiagGroup>(groupInt);
     for (auto id : testIdsForGroup(g)) {
         if (!m_enabledTests.contains(id)) return false;
     }
@@ -257,7 +259,7 @@ bool AppState::isGroupAllEnabled(int groupInt) const {
 }
 
 bool AppState::isGroupAnyEnabled(int groupInt) const {
-    auto g = static_cast<TestGroup>(groupInt);
+    auto g = static_cast<DiagGroup>(groupInt);
     for (auto id : testIdsForGroup(g)) {
         if (m_enabledTests.contains(id)) return true;
     }
@@ -269,21 +271,23 @@ void AppState::runDiagnostics() {
     if (m_runStatus == RunStatus::Running) return;
     fprintf(stderr, "[TRACE] runDiagnostics start target='%s'\n", m_target.toUtf8().constData());
 
+    // Reset state before each run (clears previous results, error messages, etc.)
+    reset();
+
     // Flutter behaviour: G1-G3 always run (local-only); G4 requires target; G5 requires URL.
     // The group-level filter below (hasTarget/isUrl) handles G4/G5 exclusion automatically.
     // No blanket error on empty target — only block if NO groups would run at all.
-    m_errorMessage.clear();
 
     // Pre-flight: check if any tests are enabled
     bool hasTarget = !isTargetEmpty();
     bool isUrl = isTargetUrl();
     bool anyEnabled = false;
     for (int g = 0; g < 5; ++g) {
-        auto group = static_cast<TestGroup>(g);
+        auto group = static_cast<DiagGroup>(g);
         for (auto id : testIdsForGroup(group)) {
             if (!m_enabledTests.contains(id)) continue;
-            if (group == TestGroup::G4 && !hasTarget) continue;
-            if (group == TestGroup::G5 && !isUrl) continue;
+            if (group == DiagGroup::G4 && !hasTarget) continue;
+            if (group == DiagGroup::G5 && !hasTarget) continue;
             anyEnabled = true;
             break;
         }
@@ -309,7 +313,7 @@ void AppState::runDiagnostics() {
     m_currentTestName.clear();
     m_currentGroup.clear();
 
-    // Build groups: group tests by TestGroup (G1→G5 order)
+    // Build groups: group tests by DiagGroup (G1→G5 order)
     m_pendingGroups.clear();
     fprintf(stderr, "[TRACE] runDiagnostics: enabledTests=%d hasTarget=%d isUrl=%d\n",
             (int)m_enabledTests.size(), hasTarget, isUrl);
@@ -317,7 +321,7 @@ void AppState::runDiagnostics() {
     for (int g = 0; g < 5; ++g) {
         int enabledInGroup = 0;
         int totalInGroup = 0;
-        auto group = static_cast<TestGroup>(g);
+        auto group = static_cast<DiagGroup>(g);
         for (auto id : testIdsForGroup(group)) {
             totalInGroup++;
             if (m_enabledTests.contains(id)) enabledInGroup++;
@@ -326,11 +330,11 @@ void AppState::runDiagnostics() {
     }
     for (int g = 0; g < 5; ++g) {
         GroupTask gt;
-        gt.group = static_cast<TestGroup>(g);
+        gt.group = static_cast<DiagGroup>(g);
         for (auto id : testIdsForGroup(gt.group)) {
             if (!m_enabledTests.contains(id)) continue;
-            if (gt.group == TestGroup::G4 && !hasTarget) continue;
-            if (gt.group == TestGroup::G5 && !isUrl) continue;
+            if (gt.group == DiagGroup::G4 && !hasTarget) continue;
+            if (gt.group == DiagGroup::G5 && !hasTarget) continue;
             gt.testIds.append(id);
             m_totalPerGroup[gt.group]++;
         }
@@ -350,6 +354,7 @@ void AppState::runDiagnostics() {
     emit runStatusChanged();
     emit progressChanged();
     emit resultsReset();
+    bumpVersion();
 
     Logger::instance().event(QStringLiteral("Starting diagnostic run: %1 tests in %2 groups")
                               .arg(m_totalTests).arg(m_pendingGroups.size()));
@@ -366,6 +371,7 @@ void AppState::startNextGroup() {
         m_currentGroup.clear();
         emit runStatusChanged();
         emit progressChanged();
+        bumpVersion();
         Logger::instance().event(QStringLiteral("Diagnostic run complete"));
         return;
     }
@@ -373,6 +379,7 @@ void AppState::startNextGroup() {
     auto& gt = m_pendingGroups[m_currentGroupIdx];
     m_currentGroup = testGroupLabel(gt.group);
     m_activeGroupDone.store(0);
+    bumpVersion();
     fprintf(stderr, "[TRACE] startGroup %s (%d tests)\n", m_currentGroup.toUtf8().constData(), (int)gt.testIds.size());
 
     for (int i = 0; i < gt.testIds.size(); ++i) {
@@ -386,20 +393,28 @@ void AppState::runTestInGroup(int groupIdx, int testIdx) {
     auto& gt = m_pendingGroups[groupIdx];
     if (testIdx >= gt.testIds.size()) return;
 
-    TestId id = gt.testIds[testIdx];
+    DiagId id = gt.testIds[testIdx];
     m_currentTestName = staticTestDisplayName(id);
     emit currentTestChanged();
     emit groupChanged();
+    bumpVersion();
 
     fprintf(stderr, "[TRACE] runTest id=%d name='%s' group=%d\n", (int)id, m_currentTestName.toUtf8().constData(), groupIdx);
 
+    // Snapshot shared state before launching detached thread — avoids data race
+    // on m_target / m_portScanFrom / m_portScanTo / m_portScanCommon which the
+    // main thread can concurrently write via setTarget() / setPortScan*().
+    QString target = m_target;
+    int psFrom = m_portScanFrom;
+    int psTo = m_portScanTo;
+    bool psCommon = m_portScanCommon;
+
     // Run test; post result back to main thread via QTimer
-     std::thread t([this, id, groupIdx]() {
+    std::thread t([this, id, groupIdx, target, psFrom, psTo, psCommon]() {
             try {
                 auto start = std::chrono::steady_clock::now();
-                auto cmd = createPlatformCommand();
-                DiagnosticEngine localEngine(std::move(cmd), nullptr);
-                DiagnosticResult result = localEngine.runTest(id, m_target, m_portScanFrom, m_portScanTo, m_portScanCommon).result();
+                DiagnosticEngine localEngine(nullptr);
+                DiagnosticResult result = localEngine.runTest(id, target, psFrom, psTo, psCommon).result();
                 auto end = std::chrono::steady_clock::now();
                 result.durationMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
                 QTimer::singleShot(0, this, [this, id, result, groupIdx]() {
@@ -426,11 +441,11 @@ void AppState::runTestInGroup(int groupIdx, int testIdx) {
     t.detach();
 }
 
-void AppState::onTestFinished(TestId id, DiagnosticResult result) {
+void AppState::onTestFinished(DiagId id, DiagnosticResult result) {
     fprintf(stderr, "[TRACE] onTestFinished id=%d status=%d\n", (int)id, (int)result.status);
     // Suppress stale results after cancel/reset
     if (m_runStatus != RunStatus::Running) return;
-    TestGroup g = testGroup(id);
+    DiagGroup g = testGroup(id);
     m_results[id] = result;
     m_totalCompleted++;
     m_completedPerGroup[g]++;
@@ -438,6 +453,7 @@ void AppState::onTestFinished(TestId id, DiagnosticResult result) {
 
     emit progressChanged();
     emit testCompleted(static_cast<int>(id));
+    bumpVersion();
 }
 
 void AppState::cancel() {
@@ -446,6 +462,7 @@ void AppState::cancel() {
     m_currentTestName.clear();
     emit runStatusChanged();
     emit progressChanged();
+    bumpVersion();
     Logger::instance().event("Diagnostic run cancelled");
 }
 
@@ -463,12 +480,13 @@ void AppState::reset() {
     emit runStatusChanged();
     emit progressChanged();
     emit resultsReset();
+    bumpVersion();
 }
 
 // ── Results for QML ────────────────────────────────────────────────────────
 QVariantList AppState::resultsForGroup(int groupInt) const {
     QVariantList list;
-    auto g = static_cast<TestGroup>(groupInt);
+    auto g = static_cast<DiagGroup>(groupInt);
     for (auto id : testIdsForGroup(g)) {
         if (m_results.contains(id)) {
             const auto& r = m_results[id];
@@ -490,10 +508,10 @@ QVariantList AppState::resultsForGroup(int groupInt) const {
     return list;
 }
 
-QVariantList AppState::allTestIdsForGroup(int groupInt) const {
+QVariantList AppState::allDiagIdsForGroup(int groupInt) const {
     QVariantList list;
     if (!isValidGroup(groupInt)) return list;
-    auto g = static_cast<TestGroup>(groupInt);
+    auto g = static_cast<DiagGroup>(groupInt);
     for (auto id : testIdsForGroup(g)) {
         list.append(static_cast<int>(id));
     }
@@ -503,7 +521,7 @@ QVariantList AppState::allTestIdsForGroup(int groupInt) const {
 QVariantList AppState::allTestsForGroup(int groupInt) const {
     QVariantList list;
     if (!isValidGroup(groupInt)) return list;
-    auto g = static_cast<TestGroup>(groupInt);
+    auto g = static_cast<DiagGroup>(groupInt);
     
     for (auto id : testIdsForGroup(g)) {
         if (!m_enabledTests.contains(id)) continue;
@@ -541,7 +559,7 @@ QVariantList AppState::allTestsForGroup(int groupInt) const {
             m["testId"] = static_cast<int>(id);  // alias for QML access (consistent with completed)
             m["displayName"] = staticTestDisplayName(id);
             m["status"] = -1;
-            m["statusIcon"] = QStringLiteral("⊖");
+            m["statusIcon"] = QStringLiteral("badge-skip");
             m["summary"] = QString(isCurrent ? "Running..." : "");
             m["details"] = QString();
             m["durationMs"] = 0;
@@ -556,22 +574,27 @@ QVariantList AppState::allTestsForGroup(int groupInt) const {
 
 QVariantMap AppState::groupStats(int groupInt) const {
     QVariantMap stats;
-    auto g = static_cast<TestGroup>(groupInt);
-    int pass = 0, warn = 0, fail = 0, skip = 0, total = 0;
+    auto g = static_cast<DiagGroup>(groupInt);
+    // total = tests actually scheduled for this group (m_totalPerGroup).
+    // Before any run this is 0 — all counts show 0.
+    int total = m_totalPerGroup.value(g, 0);
+    int pass = 0, warn = 0, fail = 0, skip = 0, info = 0, completed = 0;
     for (auto id : testIdsForGroup(g)) {
         if (!m_results.contains(id)) continue;
-        total++;
+        completed++;
         switch (m_results[id].status) {
-            case TestStatus::Pass: pass++; break;
+            case TestStatus::Pass:    pass++; break;
             case TestStatus::Warning: warn++; break;
-            case TestStatus::Fail: fail++; break;
+            case TestStatus::Fail:    fail++; break;
             case TestStatus::Skipped: skip++; break;
+            case TestStatus::Info:    info++; break;
             default: break;
         }
     }
     stats["pass"] = pass; stats["warn"] = warn;
-    stats["fail"] = fail; stats["skip"] = skip; stats["total"] = total;
-    stats["enabled"] = m_totalPerGroup.value(g, 0);
+    stats["fail"] = fail; stats["skip"] = skip; stats["info"] = info;
+    stats["completed"] = completed; stats["total"] = total;
+    stats["enabled"] = total;
     return stats;
 }
 
@@ -582,49 +605,48 @@ QString AppState::currentTestLabel() const {
 }
 
 QString AppState::testDisplayName(int testIdInt) const {
-    return staticTestDisplayName(static_cast<TestId>(testIdInt));
+    return staticTestDisplayName(static_cast<DiagId>(testIdInt));
 }
 
-QString AppState::staticTestDisplayName(TestId id) {
+QString AppState::staticTestDisplayName(DiagId id) {
     switch (id) {
-        case TestId::G1NetworkAdapters: return QStringLiteral("Network Adapters");
-        case TestId::G1NicAdvanced: return QStringLiteral("NIC Advanced");
-        case TestId::G1WifiDiagnostics: return QStringLiteral("WiFi");
-        case TestId::G1WiredDiagnostics: return QStringLiteral("Wired");
-        case TestId::G1DhcpStatus: return QStringLiteral("DHCP Status");
-        case TestId::G1IpConfiguration: return QStringLiteral("IP Config");
-        case TestId::G1ActiveConnections: return QStringLiteral("Active Connections");
-        case TestId::G2NetworkProfile: return QStringLiteral("Network Profile");
-        case TestId::G2TcpSettings: return QStringLiteral("TCP Settings");
-        case TestId::G2DefaultGateway: return QStringLiteral("Default Gateway");
-        case TestId::G2RoutingTable: return QStringLiteral("Routing Table");
-        case TestId::G2ArpTable: return QStringLiteral("ARP Table");
-        case TestId::G2ProxySettings: return QStringLiteral("Proxy Settings");
-        case TestId::G3NetskopeStatus: return QStringLiteral("Netskope Status");
-        case TestId::G3DnsServers: return QStringLiteral("DNS Servers");
-        case TestId::G3DnsCache: return QStringLiteral("DNS Cache");
-        case TestId::G3DnsPollution: return QStringLiteral("DNS Pollution");
-        case TestId::G3InternetConnectivity: return QStringLiteral("Internet");
-        case TestId::G3InternetSpeedTest: return QStringLiteral("Speed Test");
-        case TestId::G4DnsResolution: return QStringLiteral("DNS Resolution");
-        case TestId::G4Ping: return QStringLiteral("Ping");
-        case TestId::G4Traceroute: return QStringLiteral("Traceroute");
-        case TestId::G4PathPing: return QStringLiteral("PathPing");
-        case TestId::G4MtuDiscovery: return QStringLiteral("MTU Discovery");
-        case TestId::G4PortScan: return QStringLiteral("Port Scan");
-        case TestId::G5UrlParsing: return QStringLiteral("URL Parsing");
-        case TestId::G5TcpConnect: return QStringLiteral("TCP Connect");
-        case TestId::G5ServiceBanner: return QStringLiteral("Service Banner");
-        case TestId::G5CurlVerbose: return QStringLiteral("HTTP Request");
-        case TestId::G5HttpHeaders: return QStringLiteral("HTTP Headers");
-        case TestId::G5SecurityHeaders: return QStringLiteral("Security Headers");
-        case TestId::G5SslCertificate: return QStringLiteral("SSL Certificate");
-        case TestId::G5HttpRedirect: return QStringLiteral("HTTP Redirect");
-        case TestId::G5HttpCompression: return QStringLiteral("HTTP Compression");
-        case TestId::G5HttpTiming: return QStringLiteral("HTTP Timing");
-        case TestId::G5FtpDiagnostics: return QStringLiteral("FTP");
-        case TestId::G5SshDiagnostics: return QStringLiteral("SSH");
-        case TestId::G5EmailDiagnostics: return QStringLiteral("Email");
+        case DiagId::G1NetworkAdapters: return QStringLiteral("Network Adapters");
+        case DiagId::G1NicAdvanced: return QStringLiteral("NIC Advanced");
+        case DiagId::G1WifiDiagnostics: return QStringLiteral("WiFi Information");
+        case DiagId::G1WiredDiagnostics: return QStringLiteral("Wired Information");
+        case DiagId::G1DhcpStatus: return QStringLiteral("DHCP Status");
+        case DiagId::G1IpConfiguration: return QStringLiteral("IP Configuration");
+        case DiagId::G1ActiveConnections: return QStringLiteral("Active Connections");
+        case DiagId::G2NetworkProfile: return QStringLiteral("Network Profile");
+        case DiagId::G2TcpSettings: return QStringLiteral("TCP Settings");
+        case DiagId::G2DefaultGateway: return QStringLiteral("Default Gateway");
+        case DiagId::G2RoutingTable: return QStringLiteral("Routing Table");
+        case DiagId::G2ArpTable: return QStringLiteral("ARP Table");
+        case DiagId::G2ProxySettings: return QStringLiteral("Proxy Settings");
+        case DiagId::G3NetskopeStatus: return QStringLiteral("Netskope Status");
+        case DiagId::G3DnsServers: return QStringLiteral("DNS Servers");
+        case DiagId::G3DnsCache: return QStringLiteral("DNS Cache");
+        case DiagId::G3DnsPollution: return QStringLiteral("DNS Pollution");
+        case DiagId::G3InternetSpeedTest: return QStringLiteral("Internet Connectivity");
+        case DiagId::G4DnsResolution: return QStringLiteral("DNS Resolution");
+        case DiagId::G4Ping: return QStringLiteral("Ping");
+        case DiagId::G4Traceroute: return QStringLiteral("Traceroute");
+        case DiagId::G4PathPing: return QStringLiteral("PathPing");
+        case DiagId::G4MtuDiscovery: return QStringLiteral("MTU Discovery");
+        case DiagId::G4PortScan: return QStringLiteral("Port Scan");
+        case DiagId::G5UrlParsing: return QStringLiteral("URL Parsing");
+        case DiagId::G5TcpConnect: return QStringLiteral("TCP Connect");
+        case DiagId::G5ServiceBanner: return QStringLiteral("Service Banner");
+        case DiagId::G5CurlVerbose: return QStringLiteral("HTTP Request");
+        case DiagId::G5HttpHeaders: return QStringLiteral("HTTP Headers");
+        case DiagId::G5SecurityHeaders: return QStringLiteral("Security Headers");
+        case DiagId::G5SslCertificate: return QStringLiteral("SSL Certificate");
+        case DiagId::G5HttpRedirect: return QStringLiteral("HTTP Redirect");
+        case DiagId::G5HttpCompression: return QStringLiteral("HTTP Compression");
+        case DiagId::G5HttpTiming: return QStringLiteral("HTTP Timing");
+        case DiagId::G5FtpDiagnostics: return QStringLiteral("FTP");
+        case DiagId::G5SshDiagnostics: return QStringLiteral("SSH");
+        case DiagId::G5EmailDiagnostics: return QStringLiteral("Email");
     }
     return QStringLiteral("Unknown");
 }
@@ -636,8 +658,8 @@ QVariantList AppState::allGroupStats() const {
 }
 
 void AppState::showDetailDialog(int testIdInt) {
-    if (!isValidTestId(testIdInt)) return;
-    auto id = static_cast<TestId>(testIdInt);
+    if (!isValidDiagId(testIdInt)) return;
+    auto id = static_cast<DiagId>(testIdInt);
     if (!m_results.contains(id)) return;
     
     const auto& r = m_results[id];
@@ -664,13 +686,13 @@ void AppState::showDetailDialog(int testIdInt) {
     auto* statusLabel = new QLabel(QStringLiteral("Status: %1    Duration: %2ms")
         .arg(statusNames.value(static_cast<int>(r.status), "Unknown"))
         .arg(r.durationMs));
-    statusLabel->setStyleSheet("font-size: 13px; font-weight: bold; color: #A0A0B8;");
+    statusLabel->setStyleSheet("font-size: 13px; font-weight: bold; color: #A0A0B8; font-family: 'JetBrains Mono';");
     layout->addWidget(statusLabel);
     
     // Summary
     if (!r.summary.isEmpty()) {
         auto* sumLabel = new QLabel(QStringLiteral("Summary: %1").arg(r.summary));
-        sumLabel->setStyleSheet("font-size: 12px; color: #E0E0E0;");
+        sumLabel->setStyleSheet("font-size: 12px; color: #E0E0E0; font-family: 'JetBrains Mono';");
         sumLabel->setWordWrap(true);
         layout->addWidget(sumLabel);
     }
@@ -678,12 +700,12 @@ void AppState::showDetailDialog(int testIdInt) {
     // Properties
     if (!r.properties.isEmpty()) {
         auto* propHeader = new QLabel("Properties:");
-        propHeader->setStyleSheet("font-size: 11px; font-weight: bold; color: #A0A0B8; margin-top: 8px;");
+        propHeader->setStyleSheet("font-size: 11px; font-weight: bold; color: #A0A0B8; margin-top: 8px; font-family: 'JetBrains Mono';");
         layout->addWidget(propHeader);
         
         for (const auto& p : r.properties) {
             auto* propLabel = new QLabel(QStringLiteral("  %1: %2").arg(p.label, p.value));
-            propLabel->setStyleSheet("font-size: 11px; color: #E0E0E0;");
+            propLabel->setStyleSheet("font-size: 11px; color: #E0E0E0; font-family: 'JetBrains Mono';");
             propLabel->setWordWrap(true);
             layout->addWidget(propLabel);
         }
@@ -692,7 +714,7 @@ void AppState::showDetailDialog(int testIdInt) {
     // Raw output (scrollable)
     if (!r.details.isEmpty()) {
         auto* outHeader = new QLabel("Output:");
-        outHeader->setStyleSheet("font-size: 11px; font-weight: bold; color: #A0A0B8; margin-top: 8px;");
+        outHeader->setStyleSheet("font-size: 11px; font-weight: bold; color: #A0A0B8; margin-top: 8px; font-family: 'JetBrains Mono';");
         layout->addWidget(outHeader);
         
         auto* scrollArea = new QScrollArea();
@@ -700,7 +722,7 @@ void AppState::showDetailDialog(int testIdInt) {
         scrollArea->setMaximumHeight(200);
         
         auto* detailText = new QLabel(r.details);
-        detailText->setStyleSheet("font-size: 10px; color: #A0A0B8; padding: 8px;");
+        detailText->setStyleSheet("font-size: 10px; color: #A0A0B8; padding: 8px; font-family: 'JetBrains Mono';");
         detailText->setWordWrap(true);
         scrollArea->setWidget(detailText);
         layout->addWidget(scrollArea);
@@ -716,8 +738,8 @@ void AppState::showDetailDialog(int testIdInt) {
 
 QVariantMap AppState::getDetailResult(int testIdInt) const {
     QVariantMap m;
-    if (!isValidTestId(testIdInt)) return m;
-    auto id = static_cast<TestId>(testIdInt);
+    if (!isValidDiagId(testIdInt)) return m;
+    auto id = static_cast<DiagId>(testIdInt);
     if (!m_results.contains(id)) return m;
     
     const auto& r = m_results[id];

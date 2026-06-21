@@ -1,5 +1,5 @@
 // =============================================================================
-// NetworkProbe.h — QTcpSocket / QSslSocket / QHostInfo wrappers for G4/G5 tests
+// NetworkProbe.h — Raw socket wrappers for G4/G5 tests
 // =============================================================================
 #pragma once
 
@@ -8,6 +8,7 @@
 #include <QHostAddress>
 #include <QUrl>
 #include <QVector>
+#include <QMap>
 #include <functional>
 
 struct TcpConnectResult {
@@ -20,6 +21,7 @@ struct PortScanEntry {
     int port = 0;
     bool open = false;
     QString error;
+    QString serviceName;  // well-known port name, e.g. "http", "ssh"
 };
 
 struct SslCertInfo {
@@ -50,13 +52,16 @@ public:
     /// TCP connect to host:port with timeout (ms). Returns result.
     static TcpConnectResult tcpConnect(const QString& host, int port, int timeoutMs = 5000);
 
-    /// Concurrent port scan. Scans common ports + optional range.
-    /// Returns list of open ports.
+    /// Concurrent port scan using raw non-blocking sockets + select().
+    /// Scans all ports in the supplied list with true parallelism.
+    /// @param host        Target hostname or IP
+    /// @param ports       List of ports to scan
+    /// @param timeoutMs   Per-connect timeout
+    /// @param maxConcurrent  Max simultaneous connections (default 64)
     static QVector<PortScanEntry> portScan(const QString& host,
-                                            const QVector<int>& commonPorts,
-                                            int fromPort = 0, int toPort = 0,
+                                            const QVector<int>& ports,
                                             int timeoutMs = 2000,
-                                            int maxConcurrent = 20);
+                                            int maxConcurrent = 64);
 
     /// Get SSL certificate info for host:port.
     static SslCertInfo sslCertInfo(const QString& host, int port = 443, int timeoutMs = 10000);
@@ -64,6 +69,9 @@ public:
     /// HTTP GET with full timing breakdown.
     static HttpTimingResult httpTiming(const QUrl& url, int timeoutMs = 30000);
 
-    /// Common diagnostic ports (FTP, SSH, SMTP, HTTP, etc.)
+    /// Common diagnostic ports with service names.
     static QVector<int> commonDiagnosticPorts();
+
+    /// Well-known port → service name map (e.g. 80→"http", 443→"https").
+    static const QMap<int, QString>& wellKnownPorts();
 };

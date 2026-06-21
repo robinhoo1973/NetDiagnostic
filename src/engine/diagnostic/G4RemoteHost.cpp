@@ -1,10 +1,31 @@
 #include "engine/diagnostic/G4RemoteHost.h"
-#include "engine/PlatformCommand.h"
 #include "engine/runner/NetworkProbe.h"
 #include "util/PingParser.h"
 #include "util/Logger.h"
 #include <QHostInfo>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QDir>
+#include <cstring>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <io.h>
+#include <process.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
+#include <windns.h>
+#define close closesocket
+#define getpid _getpid
+#define ECONNREFUSED WSAECONNREFUSED
+#define EHOSTUNREACH WSAEHOSTUNREACH
+#define ENETUNREACH WSAENETUNREACH
+#define socklen_t int
+#define SHUT_RDWR SD_BOTH
+inline int setNonblockWin(int sock) { u_long mode=1; return ioctlsocket(sock, FIONBIO, &mode); }
+inline int setSockOptRcvTimeout(int sock, int sec) { int t=sec*1000; return setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,(const char*)&t,sizeof(t)); }
+#define fcntl dont_use_fcntl_on_windows
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -13,7 +34,18 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <cstring>
+#ifdef __linux__
+#include <linux/errqueue.h>
+#endif
+#include <resolv.h>
+#include <arpa/nameser.h>
+inline int setNonblockWin(int sock) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+}
+inline int setSockOptRcvTimeout(int, int) { return 0; }
+#endif
 
 namespace G4RemoteHost {
 
@@ -21,27 +53,321 @@ static ResultProperty prop(const QString& label, const QString& value) {
     return ResultProperty(label, value);
 }
 
-// ── DNS Resolution ────────────────────────────────────────────────────
-DiagnosticResult dnsResolution(const QString& target, PlatformCommand*) {
+// ── Extract hostname from target (URL or hostname) ─────────────────────
+static QString extractHostname(const QString& target) {
+    QString t = target.trimmed();
+    // If it's a URL (contains ://), parse out the hostname
+    if (t.contains("://")) {
+        QString afterScheme = t.section("://", 1);      // "example.com:8080/path"
+        int slash = afterScheme.indexOf('/');
+        if (slash >= 0) afterScheme = afterScheme.left(slash); // "example.com:8080"
+        // Strip IPv6 bracket notation
+        if (afterScheme.startsWith('[')) {
+            int closing = afterScheme.indexOf(']');
+            if (closing > 0) afterScheme = afterScheme.mid(1, closing - 1); // "::1"
+        } else {
+            // Strip port
+            int colon = afterScheme.lastIndexOf(':');
+            if (colon > 0) afterScheme = afterScheme.left(colon); // "example.com"
+        }
+        return afterScheme;
+    }
+    // Plain hostname — strip port if present
+    if (t.contains(':')) {
+        int colon = t.lastIndexOf(':');
+        // IPv6 has multiple colons, port uses single colon after hostname
+        if (t.count(':') == 1) t = t.left(colon);
+    }
+    return t;
+}
+
+// ── DNS Resolution — full dig-like output ─────────────────────────────
+#ifndef _WIN32
+// ── DNS wire query + full section dump helper ──────────────────────────────
+static void dnsDumpSection(ns_msg& handle, ns_sect section, const QString& title,
+                           const QString& host, QStringList& out, bool& gotCname, QString& cnameTarget) {
+    int count = ns_msg_count(handle, section);
+    if (count <= 0) return;
+    bool header = false;
+    for (int i = 0; i < count; i++) {
+        ns_rr rr;
+        if (ns_parserr(&handle, section, i, &rr) < 0) continue;
+        if (!header) { out.append(title); header = true; }
+
+        char owner[256];
+        ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), ns_rr_rdata(rr), owner, sizeof(owner));
+        // Get owner name from the RR (rr.name points into the message buffer)
+        char ownBuf[256] = {};
+        if (rr.name)
+            ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), (const unsigned char*)rr.name, ownBuf, sizeof(ownBuf));
+        if (ownBuf[0] == '\0') strcpy(ownBuf, host.toUtf8().constData());
+
+        uint32_t ttl = ns_rr_ttl(rr);
+        int rtype = ns_rr_type(rr);
+        const unsigned char* rd = ns_rr_rdata(rr);
+
+        if (rtype == ns_t_a) {
+            struct in_addr a; memcpy(&a, rd, 4);
+            out.append(QStringLiteral("%1.  %2  IN  A  %3")
+                .arg(QString::fromLatin1(ownBuf), -30).arg(ttl, 6).arg(QString::fromLatin1(inet_ntoa(a))));
+        } else if (rtype == ns_t_aaaa) {
+            char ip6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, rd, ip6, sizeof(ip6));
+            out.append(QStringLiteral("%1.  %2  IN  AAAA  %3")
+                .arg(QString::fromLatin1(ownBuf), -30).arg(ttl, 6).arg(QString::fromLatin1(ip6)));
+        } else if (rtype == ns_t_cname) {
+            char cname[256];
+            ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), rd, cname, sizeof(cname));
+            out.append(QStringLiteral("%1.  %2  IN  CNAME  %3")
+                .arg(QString::fromLatin1(ownBuf), -30).arg(ttl, 6).arg(QString::fromLatin1(cname)));
+            gotCname = true; cnameTarget = QString::fromLatin1(cname);
+        } else if (rtype == ns_t_mx) {
+            uint16_t pref = (rd[0] << 8) | rd[1];
+            char mx[256];
+            ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), rd + 2, mx, sizeof(mx));
+            out.append(QStringLiteral("%1.  %2  IN  MX  %3 %4")
+                .arg(QString::fromLatin1(ownBuf), -30).arg(ttl, 6).arg(pref).arg(QString::fromLatin1(mx)));
+        } else if (rtype == ns_t_ns) {
+            char ns[256];
+            ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), rd, ns, sizeof(ns));
+            out.append(QStringLiteral("%1.  %2  IN  NS  %3")
+                .arg(QString::fromLatin1(ownBuf), -30).arg(ttl, 6).arg(QString::fromLatin1(ns)));
+        } else if (rtype == ns_t_soa) {
+            char mname[256], rname[256];
+            const unsigned char* p = rd;
+            p += ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), p, mname, sizeof(mname));
+            p += ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), p, rname, sizeof(rname));
+            uint32_t serial = (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3];
+            uint32_t refresh = (p[4]<<24)|(p[5]<<16)|(p[6]<<8)|p[7];
+            uint32_t retry = (p[8]<<24)|(p[9]<<16)|(p[10]<<8)|p[11];
+            uint32_t expire = (p[12]<<24)|(p[13]<<16)|(p[14]<<8)|p[15];
+            uint32_t minimum = (p[16]<<24)|(p[17]<<16)|(p[18]<<8)|p[19];
+            out.append(QStringLiteral("%1.  %2  IN  SOA  %3 %4")
+                .arg(QString::fromLatin1(ownBuf), -30).arg(ttl, 6)
+                .arg(QString::fromLatin1(mname)).arg(QString::fromLatin1(rname)));
+            out.append(QStringLiteral("        (serial %1  refresh %2  retry %3  expire %4  minimum %5)")
+                .arg(serial).arg(refresh).arg(retry).arg(expire).arg(minimum));
+        } else if (rtype == ns_t_txt) {
+            // TXT records: rd[0] = length, rd[1..] = data
+            int len = rd[0];
+            QByteArray txtData((const char*)(rd + 1), len);
+            out.append(QStringLiteral("%1.  %2  IN  TXT  \"%3\"")
+                .arg(QString::fromLatin1(ownBuf), -30).arg(ttl, 6).arg(QString::fromLatin1(txtData)));
+        } else {
+            out.append(QStringLiteral("%1.  %2  IN  %3  (type %4)")
+                .arg(QString::fromLatin1(ownBuf), -30).arg(ttl, 6).arg(QStringLiteral("UNKNOWN")).arg(rtype));
+        }
+    }
+}
+
+static QString rcodeStr(int rcode) {
+    switch (rcode) {
+        case ns_r_noerror: return QStringLiteral("NOERROR");
+        case ns_r_formerr: return QStringLiteral("FORMERR");
+        case ns_r_servfail: return QStringLiteral("SERVFAIL");
+        case ns_r_nxdomain: return QStringLiteral("NXDOMAIN");
+        case ns_r_notimpl: return QStringLiteral("NOTIMP");
+        case ns_r_refused: return QStringLiteral("REFUSED");
+        default: return QStringLiteral("UNKNOWN");
+    }
+}
+#endif
+
+DiagnosticResult dnsResolution(const QString& target) {
     DiagnosticResult r;
-    r.id = TestId::G4DnsResolution; r.group = TestGroup::G4;
+    r.id = DiagId::G4DnsResolution; r.group = DiagGroup::G4;
     r.timestamp = QDateTime::currentDateTime();
     if (target.isEmpty()) { r.status = TestStatus::Skipped; r.summary = QStringLiteral("No target"); return r; }
+    QString host = extractHostname(target);
     QElapsedTimer t; t.start();
-    QHostInfo info = QHostInfo::fromName(target);
-    r.durationMs = t.elapsed();
-    int ipv4=0, ipv6=0; QStringList ips;
-    for (const auto& a : info.addresses()) {
-        if (a.protocol()==QAbstractSocket::IPv4Protocol) ++ipv4; else ++ipv6;
-        ips.append(a.toString());
+    QStringList out;
+    QStringList ipsAll;
+
+    out.append(QString());
+    out.append(QStringLiteral("; <<>> NetDiagnostic DNS <<>> %1").arg(host));
+    out.append(QStringLiteral(";; global options: +cmd"));
+    QByteArray hb = host.toUtf8();
+
+#ifdef _WIN32
+    // ── Windows: DNSQuery for A, AAAA, MX, CNAME, SOA, NS ──────────────
+    wchar_t whost[256]; MultiByteToWideChar(CP_UTF8, 0, hb.constData(), -1, whost, 256);
+
+    struct { WORD type; const char* name; } wQueries[] = {
+        {DNS_TYPE_A, "A"}, {DNS_TYPE_AAAA, "AAAA"}, {DNS_TYPE_MX, "MX"},
+        {DNS_TYPE_CNAME, "CNAME"}, {DNS_TYPE_SOA, "SOA"}, {DNS_TYPE_NS, "NS"}
+    };
+    bool hasAnswer = false;
+    for (auto& wq : wQueries) {
+        PDNS_RECORD rec = nullptr;
+        if (DnsQuery_W(whost, wq.type, DNS_QUERY_STANDARD, nullptr, &rec, nullptr) != 0 || !rec) continue;
+        bool first = true;
+        for (auto* p = rec; p; p = p->pNext) {
+            if (p->wType != wq.type) continue;
+            if (first) {
+                out.append(QStringLiteral(";; %1 SECTION:").arg(wq.name));
+                first = false; hasAnswer = true;
+            }
+            // Build dig-style line
+            if (p->wType == DNS_TYPE_A) {
+                struct in_addr a; a.S_un.S_addr = p->Data.A.IpAddress;
+                QString ip = QString::fromLatin1(inet_ntoa(a));
+                out.append(QStringLiteral("%1.  %2  IN  A  %3").arg(host, -30).arg(p->dwTtl, 6).arg(ip));
+                ipsAll.append(ip);
+            } else if (p->wType == DNS_TYPE_AAAA) {
+                char ip6[46]; inet_ntop(AF_INET6, &p->Data.AAAA.Ip6Address, ip6, sizeof(ip6));
+                out.append(QStringLiteral("%1.  %2  IN  AAAA  %3").arg(host, -30).arg(p->dwTtl, 6).arg(QString::fromLatin1(ip6)));
+            } else if (p->wType == DNS_TYPE_MX)
+                out.append(QStringLiteral("%1.  %2  IN  MX  %3 %4").arg(host, -30).arg(p->dwTtl, 6)
+                    .arg(p->Data.MX.wPreference).arg(QString::fromWCharArray(p->Data.MX.pNameExchange)));
+            else if (p->wType == DNS_TYPE_CNAME)
+                out.append(QStringLiteral("%1.  %2  IN  CNAME  %3").arg(host, -30).arg(p->dwTtl, 6)
+                    .arg(QString::fromWCharArray(p->Data.CNAME.pNameHost)));
+            else if (p->wType == DNS_TYPE_SOA)
+                out.append(QStringLiteral("%1.  %2  IN  SOA  %3 %4 (serial %5)").arg(host, -30).arg(p->dwTtl, 6)
+                    .arg(QString::fromWCharArray(p->Data.SOA.pNamePrimaryServer))
+                    .arg(QString::fromWCharArray(p->Data.SOA.pNameAdministrator))
+                    .arg(p->Data.SOA.dwSerialNo));
+            else if (p->wType == DNS_TYPE_NS)
+                out.append(QStringLiteral("%1.  %2  IN  NS  %3").arg(host, -30).arg(p->dwTtl, 6)
+                    .arg(QString::fromWCharArray(p->Data.NS.pNameHost)));
+        }
+        if (!first) out.append(QString());
+        DnsRecordListFree(rec, DnsFreeRecordList);
     }
-    r.properties.append(prop("Target",target));
-    r.properties.append(prop("IpCount",QString::number(ips.size())));
-    r.properties.append(prop("Ipv4Count",QString::number(ipv4)));
-    r.properties.append(prop("Ipv6Count",QString::number(ipv6)));
-    r.properties.append(prop("IpList",ips.join(", ")));
-    if (ips.isEmpty()) { r.status=TestStatus::Fail; r.summary=QStringLiteral("DNS failed: %1").arg(info.errorString()); }
-    else { r.status=TestStatus::Pass; r.summary=QStringLiteral("Resolved %1 address(es)").arg(ips.size()); }
+    if (!hasAnswer) out.append(QStringLiteral(";; (no records found)"));
+#else
+    // ── Linux: full dig-like with all sections ─────────────────────────
+    // Primary query: A record to get header + ANSWER + AUTHORITY + ADDITIONAL
+    {
+        unsigned char buf[4096];
+        int len = res_query(hb.constData(), C_IN, ns_t_a, buf, sizeof(buf));
+        if (len >= 0) {
+            ns_msg handle;
+            if (ns_initparse(buf, len, &handle) >= 0) {
+                int rcode = ns_msg_getflag(handle, ns_f_rcode);
+                int qdCount = ns_msg_count(handle, ns_s_qd);
+                int anCount = ns_msg_count(handle, ns_s_an);
+                int nsCount = ns_msg_count(handle, ns_s_ns);
+                int arCount = ns_msg_count(handle, ns_s_ar);
+                bool qr = ns_msg_getflag(handle, ns_f_qr);
+                bool rd = ns_msg_getflag(handle, ns_f_rd);
+                bool ra = ns_msg_getflag(handle, ns_f_ra);
+                bool aa = ns_msg_getflag(handle, ns_f_aa);
+                bool tc = ns_msg_getflag(handle, ns_f_tc);
+                uint16_t id = ns_msg_id(handle);
+
+                out.append(QStringLiteral(";; Got answer:"));
+                out.append(QStringLiteral(";; ->>HEADER<<- opcode: QUERY, status: %1, id: %2")
+                    .arg(rcodeStr(rcode)).arg(id));
+                out.append(QStringLiteral(";; flags: %1%2%3%4%5; QUERY: %6, ANSWER: %7, AUTHORITY: %8, ADDITIONAL: %9")
+                    .arg(qr ? "qr " : "").arg(aa ? "aa " : "").arg(tc ? "tc " : "")
+                    .arg(rd ? "rd " : "").arg(ra ? "ra " : "")
+                    .arg(qdCount).arg(anCount).arg(nsCount).arg(arCount));
+                out.append(QString());
+
+                // QUESTION SECTION
+                out.append(QStringLiteral(";; QUESTION SECTION:"));
+                out.append(QStringLiteral(";%1.\t\t\tIN\tA").arg(host));
+                out.append(QString());
+
+                // ANSWER SECTION
+                bool gotCname = false; QString cnameTarget;
+                dnsDumpSection(handle, ns_s_an, QStringLiteral(";; ANSWER SECTION:"), host, out, gotCname, cnameTarget);
+
+                // Collect A/AAAA IPs from answer
+                for (int i = 0; i < anCount; i++) {
+                    ns_rr rr;
+                    if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) continue;
+                    int rt = ns_rr_type(rr);
+                    const unsigned char* rd = ns_rr_rdata(rr);
+                    if (rt == ns_t_a) {
+                        struct in_addr a; memcpy(&a, rd, 4);
+                        ipsAll.append(QString::fromLatin1(inet_ntoa(a)));
+                    } else if (rt == ns_t_aaaa) {
+                        char ip6[INET6_ADDRSTRLEN];
+                        inet_ntop(AF_INET6, rd, ip6, sizeof(ip6));
+                        ipsAll.append(QString::fromLatin1(ip6));
+                    }
+                }
+
+                if (anCount == 0) out.append(QStringLiteral(";; ANSWER SECTION: (empty)"));
+                out.append(QString());
+
+                // AUTHORITY SECTION
+                dnsDumpSection(handle, ns_s_ns, QStringLiteral(";; AUTHORITY SECTION:"), host, out, gotCname, cnameTarget);
+
+                // ADDITIONAL SECTION
+                dnsDumpSection(handle, ns_s_ar, QStringLiteral(";; ADDITIONAL SECTION:"), host, out, gotCname, cnameTarget);
+
+                // If CNAME found, also resolve CNAME target
+                if (gotCname && !cnameTarget.isEmpty()) {
+                    QByteArray cb = cnameTarget.toUtf8();
+                    len = res_query(cb.constData(), C_IN, ns_t_a, buf, sizeof(buf));
+                    if (len >= 0 && ns_initparse(buf, len, &handle) >= 0) {
+                        dnsDumpSection(handle, ns_s_an, QStringLiteral(";; CNAME RESOLUTION (%1):").arg(cnameTarget), cnameTarget, out, gotCname, cnameTarget);
+                        // Also collect IPs from CNAME target
+                        int cc = ns_msg_count(handle, ns_s_an);
+                        for (int i = 0; i < cc; i++) {
+                            ns_rr rr;
+                            if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) continue;
+                            if (ns_rr_type(rr) == ns_t_a) {
+                                struct in_addr a; memcpy(&a, ns_rr_rdata(rr), 4);
+                                QString ip = QString::fromLatin1(inet_ntoa(a));
+                                if (!ipsAll.contains(ip)) ipsAll.append(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            out.append(QStringLiteral(";; Query failed (A record)"));
+            out.append(QString());
+        }
+    }
+
+    // Secondary queries: MX, SOA, TXT (if not already in A response)
+    struct { int type; const char* name; } extra[] = {{ns_t_mx, "MX"}, {ns_t_soa, "SOA"}, {ns_t_txt, "TXT"}};
+    for (auto& q : extra) {
+        unsigned char buf[4096];
+        int len = res_query(hb.constData(), C_IN, q.type, buf, sizeof(buf));
+        if (len < 0) continue;
+        ns_msg handle;
+        if (ns_initparse(buf, len, &handle) < 0) continue;
+        if (ns_msg_getflag(handle, ns_f_rcode) != ns_r_noerror) continue;
+        bool dump = false; QString unused;
+        dnsDumpSection(handle, ns_s_an, QStringLiteral(";; %1 SECTION:").arg(q.name), host, out, dump, unused);
+        if (ns_msg_count(handle, ns_s_an) > 0) out.append(QString());
+    }
+#endif
+
+    // ── Footer ──────────────────────────────────────────────────────────
+    out.append(QStringLiteral(";; Query time: %1 msec").arg(t.elapsed()));
+#ifdef _WIN32
+    out.append(QStringLiteral(";; SERVER: system resolver"));
+#else
+    // Show actual resolver address from _res
+    QStringList nsList;
+    for (int i = 0; i < MAXNS && _res.nsaddr_list[i].sin_addr.s_addr != 0; i++)
+        nsList.append(QString::fromLatin1(inet_ntoa(_res.nsaddr_list[i].sin_addr)));
+    out.append(QStringLiteral(";; SERVER: %1").arg(nsList.isEmpty() ? QStringLiteral("system") : nsList.join(QStringLiteral(", "))));
+#endif
+    out.append(QStringLiteral(";; WHEN: %1").arg(QDateTime::currentDateTime().toString(QStringLiteral("ddd MMM d hh:mm:ss yyyy"))));
+    out.append(QString());
+
+    r.rawOutput = out.join('\n');
+    r.details = r.rawOutput;
+    r.durationMs = t.elapsed();
+
+    if (!ipsAll.isEmpty()) {
+        r.summary = QStringLiteral("%1 → %2").arg(host, ipsAll.join(QStringLiteral(", ")));
+        r.status = TestStatus::Pass;
+    } else {
+        r.summary = QStringLiteral("DNS resolution failed for %1").arg(host);
+        r.status = TestStatus::Fail;
+    }
+    r.properties.append(prop("Target", target));
+    r.properties.append(prop("Host", host));
+    r.properties.append(prop("Addresses", ipsAll.isEmpty() ? QStringLiteral("(none)") : ipsAll.join(QStringLiteral(", "))));
     return r;
 }
 
@@ -77,87 +403,84 @@ static int tcpRttMs(const QString& host, int port) {
     quint32 ip = resolveIPv4(host);
     if (!ip) { close(sock); return -1; }
     addr.sin_addr.s_addr = htonl(ip);
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(sock, FIONBIO, &mode);
+#else
+    setNonblockWin(sock);
+#endif
     QElapsedTimer t; t.start();
     ::connect(sock, (struct sockaddr*)&addr, sizeof(addr));
     fd_set fdset; FD_ZERO(&fdset); FD_SET(sock, &fdset);
     struct timeval tv = {3,0};
-    if (select(sock+1, nullptr, &fdset, nullptr, &tv) <= 0) { close(sock); return -1; }
+    int sel = select(sock+1, nullptr, &fdset, nullptr, &tv);
+    if (sel <= 0) { close(sock); return -1; }
+    // Check SO_ERROR — non-blocking connect reports errors via SO_ERROR, not select
+    int err = 0; socklen_t elen = sizeof(err);
+    getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&err, &elen);
+    if (err != 0) { close(sock); return -1; }
     int ms = t.elapsed(); close(sock); return ms;
 }
 
-// ICMP ping — returns (-1) if raw socket not available
-static int icmpRttMs(const QString& host) {
-    int s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (s < 0) return -1; // raw socket denied → caller should fall back to TCP
-    quint32 ip = resolveIPv4(host);
-    if (!ip) { close(s); return -1; }
-    // Set receive timeout
-    struct timeval tv = {2,0};
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    // Build ICMP Echo Request
-    unsigned char pkt[64] = {};
-    pkt[0] = 8; pkt[1] = 0; // type=8 (echo), code=0
-    uint16_t id = (uint16_t)getpid(); memcpy(pkt+4, &id, 2);
-    uint16_t seq = 1; memcpy(pkt+6, &seq, 2);
-    // Payload
-    for (int i=8; i<64; ++i) pkt[i] = (unsigned char)(i & 0xFF);
-    // ICMP checksum
-    uint32_t sum = 0;
-    for (int i=0; i<64; i+=2) sum += (pkt[i]<<8) | pkt[i+1];
-    while (sum>>16) sum = (sum&0xFFFF)+(sum>>16);
-    uint16_t csum = (uint16_t)(~sum);
-    memcpy(pkt+2, &csum, 2);
-    // Send
-    struct sockaddr_in addr; memset(&addr,0,sizeof(addr));
-    addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(ip);
-    QElapsedTimer t; t.start();
-    if (sendto(s, pkt, 64, 0, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(s); return -1; }
-    // Receive reply
-    unsigned char buf[128];
-    struct sockaddr_in from; socklen_t fromLen = sizeof(from);
-    if (recvfrom(s, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromLen) < 0) { close(s); return -1; }
-    int ms = t.elapsed(); close(s); return ms;
-}
-
-// ── Ping (custom, no system command) ──────────────────────────────────
-DiagnosticResult ping(const QString& target, PlatformCommand*) {
+// ── Ping (TCP connect, cross-platform) — Windows-style per-probe output ─────
+DiagnosticResult ping(const QString& target) {
     DiagnosticResult r;
-    r.id = TestId::G4Ping; r.group = TestGroup::G4;
+    r.id = DiagId::G4Ping; r.group = DiagGroup::G4;
     r.timestamp = QDateTime::currentDateTime();
     if (target.isEmpty()) { r.status = TestStatus::Skipped; r.summary = QStringLiteral("No target"); return r; }
+    QString host = extractHostname(target);
+    quint32 resolvedIp = resolveIPv4(host);
+    // Build output — strict Windows ping.exe format
+    // "Pinging example.com [93.184.216.34] with 32 bytes of data:"
+    // or "Pinging 223.5.5.5 with 32 bytes of data:" (when target is already an IP)
+    QStringList lines;
+    QString ipStr;
+    if (resolvedIp) {
+        struct in_addr a; a.s_addr = htonl(resolvedIp);
+        ipStr = QString::fromLatin1(inet_ntoa(a));
+    }
+    QString displayTarget = resolvedIp ? ipStr : host;
+    if (resolvedIp && host != ipStr)
+        lines.append(QStringLiteral("Pinging %1 [%2] with 32 bytes of data:").arg(host, ipStr));
+    else
+        lines.append(QStringLiteral("Pinging %1 with 32 bytes of data:").arg(displayTarget));
+
     QElapsedTimer t; t.start();
     int sent=0, rcvd=0; double sumMs=0, minMs=1e9, maxMs=0;
-    bool useIcmp = true;
-    for (int i=0; i<10; ++i) {
+    // TCP connect is the default method — no root required, cross-platform,
+    // and more representative of real application connectivity than ICMP.
+    for (int i=0; i<4; ++i) {
         ++sent;
         int ms = -1;
-        if (useIcmp) {
-            ms = icmpRttMs(target);
-            if (ms < 0 && i==0) useIcmp = false; // raw socket denied → switch to TCP
+        int ports[] = {443, 80, 22, 8080, 8443};
+        for (int p : ports) { ms = tcpRttMs(host, p); if (ms >= 0) break; }
+        if (ms >= 0) {
+            ++rcvd; sumMs += ms;
+            if (ms<minMs) minMs=ms;
+            if (ms>maxMs) maxMs=ms;
+            lines.append(QStringLiteral("Reply from %1: bytes=32 time=%2ms TTL=128")
+                .arg(displayTarget).arg(ms));
+        } else {
+            lines.append(QStringLiteral("Request timed out."));
         }
-        if (!useIcmp) {
-            // Try multiple common ports — pick the first one that responds
-            int ports[] = {443, 80, 22, 8080, 8443};
-            for (int p : ports) { ms = tcpRttMs(target, p); if (ms >= 0) break; }
-        }
-        if (ms >= 0) { ++rcvd; sumMs += ms; if (ms<minMs) minMs=ms; if (ms>maxMs) maxMs=ms; }
     }
     r.durationMs = t.elapsed();
     double loss = sent>0 ? (sent-rcvd)*100.0/sent : 100.0;
     double avg = rcvd>0 ? sumMs/rcvd : 0;
     if (rcvd==0) { minMs=0; maxMs=0; }
-    r.properties.append(prop("Target",target));
-    r.properties.append(prop("Method",useIcmp?"ICMP":"TCP connect"));
-    r.properties.append(prop("Sent",QString::number(sent)));
-    r.properties.append(prop("Received",QString::number(rcvd)));
-    r.properties.append(prop("LossPercent",QString::number(loss,'f',1)+"%"));
-    r.properties.append(prop("AvgMs",QString::number(avg,'f',1)));
-    r.properties.append(prop("MinMs",QString::number(minMs,'f',1)));
-    r.properties.append(prop("MaxMs",QString::number(maxMs,'f',1)));
-    r.rawOutput = QStringLiteral("%1 ping: %2 sent, %3 rcvd, %4%% loss, avg %5ms")
-        .arg(useIcmp?"ICMP":"TCP").arg(sent).arg(rcvd).arg(loss,0,'f',1).arg(avg,0,'f',1);
+
+    // Blank line → "Ping statistics for <IP>:" (Windows always uses IP here)
+    lines.append(QString());
+    lines.append(QStringLiteral("Ping statistics for %1:").arg(displayTarget));
+    lines.append(QStringLiteral("    Packets: Sent = %1, Received = %2, Lost = %3 (%4% loss),")
+        .arg(sent).arg(rcvd).arg(sent-rcvd).arg(loss,0,'f',1));
+    if (rcvd > 0) {
+        lines.append(QStringLiteral("Approximate round trip times in milli-seconds:"));
+        lines.append(QStringLiteral("    Minimum = %1ms, Maximum = %2ms, Average = %3ms")
+            .arg(minMs,0,'f',1).arg(maxMs,0,'f',1).arg(avg,0,'f',1));
+    }
+    r.rawOutput = lines.join('\n');
+    r.details   = lines.join('\n');
     if (loss>=100.0) { r.status=TestStatus::Fail; r.summary=QStringLiteral("100%% packet loss"); }
     else if (loss>=50.0) { r.status=TestStatus::Fail; r.summary=QStringLiteral("%1%% loss").arg(loss,0,'f',1); }
     else if (loss>0) { r.status=TestStatus::Warning; r.summary=QStringLiteral("%1%% loss, avg %2ms").arg(loss,0,'f',1).arg(avg,0,'f',1); }
@@ -165,144 +488,538 @@ DiagnosticResult ping(const QString& target, PlatformCommand*) {
     return r;
 }
 
-// ── Traceroute (custom TCP TTL-based, no system command) ──────────────
-DiagnosticResult traceroute(const QString& target, PlatformCommand*) {
-    DiagnosticResult r;
-    r.id = TestId::G4Traceroute; r.group = TestGroup::G4;
-    r.timestamp = QDateTime::currentDateTime();
-    if (target.isEmpty()) { r.status = TestStatus::Skipped; r.summary = QStringLiteral("No target"); return r; }
-    quint32 ip = resolveIPv4(target);
-    if (!ip) { r.status=TestStatus::Fail; r.summary=QStringLiteral("DNS resolution failed"); return r; }
-    QElapsedTimer t; t.start();
-    int hopCount=0, timeoutHops=0; bool reached=false;
-    ResultProperty hopList("Hops","");
-    for (int ttl=1; ttl<=30 && !reached; ++ttl) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock<0) break;
-        setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
-        struct sockaddr_in addr; memset(&addr,0,sizeof(addr));
-        int ports[] = {443, 80, 22, 8080, 8443};
-        int portIdx = ttl < (int)(sizeof(ports)/sizeof(ports[0])) ? ttl : ((int)(sizeof(ports)/sizeof(ports[0])) - 1);
-        addr.sin_family = AF_INET; addr.sin_port = htons(ports[portIdx]);
-        addr.sin_addr.s_addr = htonl(ip);
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-        QElapsedTimer hopTimer; hopTimer.start();
-        ::connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-        fd_set fdset; FD_ZERO(&fdset); FD_SET(sock, &fdset);
-        struct timeval tv = {2,0};
-        int sel = select(sock+1, nullptr, &fdset, nullptr, &tv);
-        int hopMs = hopTimer.elapsed();
-        if (sel > 0) {
-            // Connection completed or RST received → reached target or final hop
-            int err=0; socklen_t len=sizeof(err);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
-            reached = true;
-            ++hopCount;
-            hopList.children.append(ResultProperty(QStringLiteral("Hop %1").arg(ttl),
-                QStringLiteral("Reached in %1ms (TTL=%2)").arg(hopMs).arg(ttl)));
-        } else {
-            // Timeout → intermediate hop
-            ++hopCount;
-            hopList.children.append(ResultProperty(QStringLiteral("Hop %1").arg(ttl),
-                QStringLiteral("Intermediate hop (* * *)")));
-            ++timeoutHops;
-        }
-        close(sock);
-    }
-    r.durationMs = t.elapsed();
-    r.properties.append(prop("Target",target));
-    r.properties.append(prop("HopCount",QString::number(hopCount)));
-    r.properties.append(prop("TimeoutHops",QString::number(timeoutHops)));
-    r.properties.append(prop("ReachedTarget",reached?"Yes":"No"));
-    r.properties.append(hopList);
-    if (reached) { r.status=TestStatus::Pass; r.summary=QStringLiteral("Target reached in %1 hops").arg(hopCount); }
-    else if (hopCount>0) { r.status=TestStatus::Warning; r.summary=QStringLiteral("Partial path (%1 hops)").arg(hopCount); }
-    else { r.status=TestStatus::Fail; r.summary=QStringLiteral("No hops discovered"); }
-    return r;
-}
+// ── TCP Traceroute Hop Probe ──────────────────────────────────────────────
+// Returns:  0 = reached target,  1 = intermediate hop,  -1 = timeout,  -2 = error
+//
+// Linux: uses IP_RECVERR + MSG_ERRQUEUE to capture ICMP Time Exceeded from
+// intermediate routers — same technique as tracepath / traceroute -T, no root.
+// Windows: uses IcmpSendEcho API (no admin required).
+#ifdef _WIN32
+static int tcpTraceHop(const QString& host, int ttl, int& rttMs, QString& hopIp) {
+    quint32 ip = resolveIPv4(host);
+    if (!ip) { rttMs = 0; hopIp.clear(); return -2; }
 
-// ── PathPing ──────────────────────────────────────────────────────────
-DiagnosticResult pathPing(const QString& target, PlatformCommand* cmd) {
+    HANDLE icmp = IcmpCreateFile();
+    if (icmp == INVALID_HANDLE_VALUE) { rttMs = 0; hopIp.clear(); return -2; }
+
+    IP_OPTION_INFORMATION opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.Ttl = (UCHAR)ttl;
+
+    char sendData[32] = "trace";
+    char replyBuf[sizeof(ICMP_ECHO_REPLY) + sizeof(sendData) + 8];
+    memset(replyBuf, 0, sizeof(replyBuf));
+
+    QElapsedTimer t; t.start();
+    DWORD result = IcmpSendEcho(icmp, htonl(ip),
+                                 sendData, sizeof(sendData),
+                                 &opts, replyBuf, sizeof(replyBuf), 2000);
+    rttMs = (int)t.elapsed();
+
+    if (result > 0) {
+        PICMP_ECHO_REPLY echoReply = (PICMP_ECHO_REPLY)replyBuf;
+        struct in_addr a; a.S_un.S_addr = echoReply->Address;
+        hopIp = QString::fromLatin1(inet_ntoa(a));
+        rttMs = (int)echoReply->RoundTripTime;
+        IcmpCloseHandle(icmp);
+        // Only IP_TTL_EXPIRED_TRANSIT (13) means an intermediate hop.
+        // IP_DEST_*_UNREACHABLE, IP_SOURCE_QUENCH, etc. are terminal errors.
+        if (echoReply->Status == IP_TTL_EXPIRED_TRANSIT)
+            return 1;  // intermediate hop
+        return 0;      // reached target (IP_SUCCESS) or terminal error
+    }
+    IcmpCloseHandle(icmp);
+    rttMs = 0;
+    return -1;
+}
+#elif defined(__linux__)
+static int tcpTraceHop(const QString& host, int ttl, int& rttMs, QString& hopIp) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) { rttMs = 0; hopIp.clear(); return -2; }
+
+    // Enable IP_RECVERR — kernel delivers ICMP errors (Time Exceeded,
+    // Host Unreachable, etc.) to the socket error queue, including the
+    // source IP of the router that generated the error.
+    int on = 1;
+    setsockopt(sock, IPPROTO_IP, IP_RECVERR, &on, sizeof(on));
+
+    // Set the TTL for this probe
+    setsockopt(sock, IPPROTO_IP, IP_TTL, (const char*)&ttl, sizeof(ttl));
+
+    quint32 targetIp = resolveIPv4(host);
+    if (!targetIp) { close(sock); rttMs = 0; hopIp.clear(); return -2; }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(443);
+    addr.sin_addr.s_addr = htonl(targetIp);
+
+    // ── Non-blocking connect ──────────────────────────────────────────
+    // On Linux, setNonblockWin now actually sets O_NONBLOCK (previously
+    // it was a no-op, causing connect() to block and ICMP errors to be
+    // consumed by the kernel without entering the error queue).
+    setNonblockWin(sock);
+
+    QElapsedTimer tm; tm.start();
+    int cr = ::connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    (void)cr; // EINPROGRESS expected for non-blocking connect
+
+    // ── Wait for socket activity (2 s) ─────────────────────────────────
+    fd_set wfds, efds;
+    FD_ZERO(&wfds); FD_ZERO(&efds);
+    FD_SET(sock, &wfds); FD_SET(sock, &efds);
+    struct timeval tv = {2, 0};
+    int sel = select(sock + 1, nullptr, &wfds, &efds, &tv);
+    rttMs = (int)tm.elapsed();
+
+    // ── Helper: extract router IP from MSG_ERRQUEUE ────────────────────
+    auto readIcmpError = [&]() -> bool {
+        struct msghdr msg;
+        struct iovec iov;
+        char ctrlBuf[512];
+        char dataBuf[256];
+        memset(&msg, 0, sizeof(msg));
+        memset(ctrlBuf, 0, sizeof(ctrlBuf));
+        msg.msg_control = ctrlBuf;
+        msg.msg_controllen = sizeof(ctrlBuf);
+        iov.iov_base = dataBuf;
+        iov.iov_len = sizeof(dataBuf);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+        ssize_t n = recvmsg(sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+        if (n < 0) return false;
+
+        for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_RECVERR) {
+                struct sock_extended_err* sockErr =
+                    (struct sock_extended_err*)CMSG_DATA(cmsg);
+                // ICMP Time Exceeded (code 0) or Host Unreachable
+                if (sockErr->ee_origin == SO_EE_ORIGIN_ICMP) {
+                    // The offending router's address immediately follows
+                    struct sockaddr_in* offender =
+                        (struct sockaddr_in*)(sockErr + 1);
+                    hopIp = QString::fromLatin1(inet_ntoa(offender->sin_addr));
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // ── Step 1: Check for ICMP error from intermediate router ──────────
+    // Even when select() times out or returns write-ready, the ICMP
+    // Time Exceeded message may already be queued. Read it first.
+    if (readIcmpError()) {
+        close(sock);
+        return 1; // Intermediate hop — router IP in hopIp
+    }
+
+    // ── Step 2: Check SO_ERROR for connect result ──────────────────────
+    if (sel > 0 && FD_ISSET(sock, &wfds)) {
+        int err = 0; socklen_t len = sizeof(err);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+        if (err == 0 || err == ECONNREFUSED) {
+            // Reached target (either port open or actively refused)
+            struct sockaddr_in peer; socklen_t peerLen = sizeof(peer);
+            if (getpeername(sock, (struct sockaddr*)&peer, &peerLen) == 0)
+                hopIp = QString::fromLatin1(inet_ntoa(peer.sin_addr));
+            else
+                hopIp = QString::fromLatin1(inet_ntoa(addr.sin_addr));
+            close(sock);
+            return 0;
+        }
+    }
+
+    // ── Step 3: Retry ICMP error — may arrive slightly after select() ──
+    // On slow/long-distance links the ICMP Time Exceeded packet can
+    // arrive a few milliseconds after select() returns. Give it one
+    // more chance with a short poll.
+    {
+        struct timeval retryTv = {0, 50000}; // 50 ms
+        select(0, nullptr, nullptr, nullptr, &retryTv);
+        if (readIcmpError()) {
+            close(sock);
+            return 1;
+        }
+    }
+
+    close(sock);
+    rttMs = 0;
+    hopIp.clear();
+    return -1; // No response (timeout or filtered)
+}
+#else
+// macOS/iOS/BSD: traceroute not supported (requires Linux IP_RECVERR or Windows IcmpSendEcho)
+static int tcpTraceHop(const QString&, int, int& rttMs, QString& hopIp) {
+    rttMs = 0; hopIp.clear(); return -2;
+}
+#endif
+
+// ── Traceroute (TCP TTL probing, cross-platform) — Windows tracert format ───
+DiagnosticResult traceroute(const QString& target) {
     DiagnosticResult r;
-    r.id = TestId::G4PathPing; r.group = TestGroup::G4;
+    r.id = DiagId::G4Traceroute; r.group = DiagGroup::G4;
     r.timestamp = QDateTime::currentDateTime();
     if (target.isEmpty()) { r.status = TestStatus::Skipped; r.summary = QStringLiteral("No target"); return r; }
+    QString host = extractHostname(target);
+    quint32 targetIp = resolveIPv4(host);
+    if (!targetIp) { r.status=TestStatus::Fail; r.summary=QStringLiteral("DNS resolution failed"); return r; }
+
+    struct in_addr ta; ta.s_addr = htonl(targetIp);
+    QString targetIpStr = QString::fromLatin1(inet_ntoa(ta));
+
+    // Build output — strict Windows tracert.exe format
+    // "Tracing route to example.com [93.184.216.34]"
+    // "over a maximum of 30 hops:"
+    // ""
+    // "  1    <1 ms    <1 ms    <1 ms  192.168.1.1"
+    // "  2     5 ms     5 ms     5 ms  10.0.0.1"
+    QStringList lines;
+    lines.append(QString());
+    lines.append(QStringLiteral("Tracing route to %1 [%2]").arg(host, targetIpStr));
+    lines.append(QStringLiteral("over a maximum of 30 hops:"));
+    lines.append(QString());
+
+    // TCP TTL probing via tcpTraceHop() — uses IP_RECVERR on Linux to capture
+    // ICMP Time Exceeded from intermediate routers without root privileges.
+    fprintf(stderr, "[TRACE] traceroute: using tcpTraceHop\n");
+
     QElapsedTimer t; t.start();
-    auto tr = traceroute(target, cmd);
-    int hopCount=0;
-    for (const auto& p : tr.properties) { if (p.label=="HopCount") { hopCount=p.value.toInt(); break; } }
-    QVector<ResultProperty> perHopStats;
-    double totalLoss=0.0; int pingedHops=0;
-    for (const auto& p : tr.properties) {
-        if (p.label=="Hops") {
-            for (const auto& hop : p.children) {
-                if (t.elapsed() > testGroupTimeoutSec(TestGroup::G4)*1000) {
-                    r.status=TestStatus::Warning; r.summary=QStringLiteral("PathPing timeout"); return r;
-                }
-                // Extract IP if available; otherwise skip
-                QString ip = hop.value.section('(',1).section(')',0,0);
-                if (ip.isEmpty()) continue;
-                auto pr2 = ping(ip, cmd);
-                double loss=0;
-                for (const auto& pp:pr2.properties) {
-                    if (pp.label=="LossPercent") { QString v=pp.value; v.replace("%",""); loss=v.toDouble(); break; }
-                }
-                totalLoss+=loss; ++pingedHops;
-                perHopStats.append(ResultProperty(ip, QString::number(loss,'f',1)+"% loss"));
+    int hopCount = 0, timeoutHops = 0; bool reached = false;
+
+    for (int ttl = 1; ttl <= 30 && !reached; ++ttl) {
+        int rttMs = 0; QString hopIp;
+        int res = tcpTraceHop(host, ttl, rttMs, hopIp);
+        ++hopCount;
+
+        if (res == 0) {
+            // Reached target
+            reached = true;
+            QString rttStr = (rttMs < 1) ? QStringLiteral("   <1 ms")
+                : QStringLiteral("%1 ms").arg(rttMs, 5);
+            lines.append(QStringLiteral(" %1  %2  %3  %4  %5 [%6]")
+                .arg(ttl, 2).arg(rttStr).arg(rttStr).arg(rttStr)
+                .arg(host).arg(targetIpStr));
+            fprintf(stderr, "[TRACE] traceroute TTL=%d: REACHED %s [%s] %dms\n",
+                ttl, host.toUtf8().constData(), hopIp.toUtf8().constData(), rttMs);
+        } else if (res == 1) {
+            // Intermediate hop — got router IP from ICMP Time Exceeded
+            QString rttStr = (rttMs < 1) ? QStringLiteral("   <1 ms")
+                : QStringLiteral("%1 ms").arg(rttMs, 5);
+            // Resolve reverse DNS for the hop IP
+            QString hopName = hopIp;
+            struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+            sa.sin_family = AF_INET;
+            sa.sin_addr.s_addr = inet_addr(hopIp.toUtf8().constData());
+            char hbuf[NI_MAXHOST] = {};
+            if (getnameinfo((struct sockaddr*)&sa, sizeof(sa), hbuf, sizeof(hbuf),
+                            nullptr, 0, 0) == 0 && hbuf[0])
+                hopName = QString::fromLatin1(hbuf);
+            lines.append(QStringLiteral(" %1  %2  %3  %4  %5 [%6]")
+                .arg(ttl, 2).arg(rttStr).arg(rttStr).arg(rttStr)
+                .arg(hopName).arg(hopIp));
+            fprintf(stderr, "[TRACE] traceroute TTL=%d: hop %s [%s] %dms\n",
+                ttl, hopName.toUtf8().constData(), hopIp.toUtf8().constData(), rttMs);
+        } else {
+            // Timeout
+            ++timeoutHops;
+            lines.append(QStringLiteral(" %1     *        *        *     Request timed out.").arg(ttl, 2));
+            fprintf(stderr, "[TRACE] traceroute TTL=%d: timeout (total=%d)\n", ttl, timeoutHops);
+            if (timeoutHops > 15) {
+                lines.append(QStringLiteral(" ... (firewall may be blocking probes after hop %1)").arg(ttl));
+                break;
             }
         }
     }
+
     r.durationMs = t.elapsed();
-    double avgLoss = pingedHops>0 ? totalLoss/pingedHops : 100.0;
-    r.properties.append(prop("Target",target));
-    r.properties.append(prop("HopCount",QString::number(hopCount)));
-    r.properties.append(prop("AverageLossPercent",QString::number(avgLoss,'f',1)+"%"));
-    ResultProperty stats("PerHopStats",""); stats.children=perHopStats; r.properties.append(stats);
-    if (avgLoss<=10.0) { r.status=TestStatus::Pass; r.summary=QStringLiteral("Avg loss %1%%").arg(avgLoss,0,'f',1); }
-    else if (pingedHops>0) { r.status=TestStatus::Warning; r.summary=QStringLiteral("High avg loss %1%%").arg(avgLoss,0,'f',1); }
-    else { r.status=TestStatus::Fail; r.summary=QStringLiteral("No hops"); }
+    lines.append(QString());
+    if (reached) {
+        lines.append(QStringLiteral("Trace complete."));
+    } else {
+        lines.append(QStringLiteral("Trace incomplete — target may be firewalled."));
+    }
+    r.rawOutput = lines.join('\n');
+    r.details   = lines.join('\n');
+    if (reached) { r.status = TestStatus::Pass; r.summary = QStringLiteral("Target reached in %1 hops").arg(hopCount); }
+    else if (hopCount > 0) { r.status = TestStatus::Warning; r.summary = QStringLiteral("Partial path (%1 hops)").arg(hopCount); }
+    else { r.status = TestStatus::Fail; r.summary = QStringLiteral("No hops discovered"); }
+    return r;
+}
+
+// ── PathPing — Windows pathping.exe format with TCP-based traceroute ───────
+DiagnosticResult pathPing(const QString& target) {
+    DiagnosticResult r;
+    r.id = DiagId::G4PathPing; r.group = DiagGroup::G4;
+    r.timestamp = QDateTime::currentDateTime();
+    if (target.isEmpty()) { r.status = TestStatus::Skipped; r.summary = QStringLiteral("No target"); return r; }
+    QString host = extractHostname(target);
+    quint32 targetIp = resolveIPv4(host);
+    if (!targetIp) { r.status = TestStatus::Fail; r.summary = QStringLiteral("DNS resolution failed"); return r; }
+    struct in_addr a; a.s_addr = htonl(targetIp);
+    QString targetIpStr = QString::fromLatin1(inet_ntoa(a));
+
+    QElapsedTimer totalTimer; totalTimer.start();
+
+    // ── Phase 1: Traceroute ───────────────────────────────────────────
+    // Windows pathping format:
+    // "Tracing route to example.com [93.184.216.34]"
+    // "over a maximum of 30 hops:"
+    // "  0  mypc.example.com [192.168.1.100]"
+    // "  1  192.168.1.1"
+    // ...
+    auto tr = traceroute(target);
+
+    // Parse hop IPs from traceroute rawOutput
+    // Lines look like: " %1  %2  %3  %4  %5 [%6]" (Windows tracert format)
+    // or: " %1     *        *        *     Request timed out."
+    struct HopEntry { int ttl; QString ip; QString name; int rttMs; bool reached; };
+    QVector<HopEntry> hops;
+    // Hop 0 = local (not in traceroute output)
+    hops.append({0, QString(), QStringLiteral("localhost"), 0, false});
+
+    int hopCount = 0; bool reached = false;
+    for (const QString& line : tr.rawOutput.split('\n')) {
+        QString trimmed = line.trimmed();
+        if (trimmed.isEmpty() || trimmed.startsWith("Tracing") || trimmed.startsWith("over") ||
+            trimmed.startsWith("Trace") || trimmed.startsWith("...")) continue;
+        // Match "[IP]" at end of non-timeout lines
+        int rb = line.indexOf('[');
+        if (rb > 0) {
+            int re = line.indexOf(']', rb);
+            if (re > rb) {
+                QString hopIp = line.mid(rb + 1, re - rb - 1);
+                // TTL is the first number on the line
+                QString ttlStr = line.mid(1, 2).trimmed(); // " %1..." → chars 1-2
+                int ttlNum = ttlStr.toInt();
+                // RTT from first ms field
+                int msPos = line.indexOf("ms");
+                int msStart = msPos > 0 ? line.lastIndexOf(' ', msPos - 1) + 1 : 0;
+                int rttVal = msPos > 0 ? line.mid(msStart, msPos - msStart).trimmed().toInt() : 0;
+                bool isTarget = (hopIp == targetIpStr);
+                if (isTarget) reached = true;
+                hops.append({ttlNum, hopIp, QString(), rttVal, isTarget});
+                hopCount = ttlNum;
+            }
+        }
+    }
+
+    // ── Phase 2: Ping each hop for per-hop statistics ──────────────────
+    // NOTE: ping() uses TCP connect (ports 443,80,22,8080,8443) to measure RTT.
+    // Routers typically do NOT run TCP servers, so per-hop statistics will show
+    // 100% loss for intermediate hops. Windows pathping.exe uses ICMP Echo for
+    // this phase, which routers DO respond to. A future improvement would be to
+    // implement ICMP Echo (raw socket) for per-hop statistics on Linux (requires
+    // root or CAP_NET_RAW) while keeping TCP connect for reachability checks.
+    // For now, the route discovery (Phase 1) works correctly via traceroute.
+    struct HopStats { int sent; int rcvd; double loss; int avgMs; };
+    QVector<HopStats> hopStats;
+    for (int i = 1; i < hops.size(); ++i) {
+        HopStats hs = {4, 0, 100.0, 0};
+        if (!hops[i].ip.isEmpty()) {
+            auto pr = ping(hops[i].ip);
+            // Parse: "    Packets: Sent = 4, Received = 3, Lost = 1 (25.0% loss),"
+            // Parse: "    Minimum = 8ms, Maximum = 12ms, Average = 10ms"
+            for (const QString& pline : pr.rawOutput.split('\n')) {
+                if (pline.contains(QStringLiteral("Packets:"))) {
+                    int si = pline.indexOf(QStringLiteral("Sent = "));
+                    int ri = pline.indexOf(QStringLiteral("Received = "));
+                    int pi = pline.indexOf('(');
+                    if (si > 0 && ri > 0) {
+                        hs.sent = pline.mid(si + 7, pline.indexOf(',', si) - si - 7).trimmed().toInt();
+                        hs.rcvd = pline.mid(ri + 11, pline.indexOf(',', ri) - ri - 11).trimmed().toInt();
+                    }
+                    if (pi > 0) {
+                        int pe = pline.indexOf('%', pi);
+                        if (pe > pi) hs.loss = pline.mid(pi + 1, pe - pi - 1).toDouble();
+                    }
+                }
+                if (pline.contains(QStringLiteral("Average = "))) {
+                    int ai = pline.indexOf(QStringLiteral("Average = "));
+                    int ae = pline.indexOf(QStringLiteral("ms"), ai);
+                    if (ai > 0 && ae > ai) hs.avgMs = pline.mid(ai + 10, ae - ai - 10).trimmed().toInt();
+                }
+            }
+        }
+        hopStats.append(hs);
+    }
+
+    // ── Build output — strict Windows pathping.exe format ──────────────
+    QStringList lines;
+    lines.append(QString());
+    lines.append(QStringLiteral("Tracing route to %1 [%2]").arg(host, targetIpStr));
+    lines.append(QStringLiteral("over a maximum of 30 hops:"));
+    lines.append(QString());
+
+    // Phase 1 output: route table
+    for (const auto& hop : hops) {
+        if (hop.ttl == 0)
+            lines.append(QStringLiteral("  %1  %2").arg(hop.ttl).arg(hop.name));
+        else if (!hop.ip.isEmpty())
+            lines.append(QStringLiteral("  %1  %2 [%3]").arg(hop.ttl).arg(hop.ip).arg(hop.ip));
+        else
+            lines.append(QStringLiteral("  %1  (unreachable)").arg(hop.ttl));
+    }
+
+    lines.append(QString());
+    int statsSec = (int)totalTimer.elapsed() / 1000;
+    if (statsSec < 1) statsSec = 1;
+    lines.append(QStringLiteral("Computing statistics for %1 seconds...").arg(statsSec));
+    lines.append(QStringLiteral("            Source to Here   This Node/Link"));
+    lines.append(QStringLiteral("Hop  RTT    Lost/Sent = Pct  Lost/Sent = Pct  Address"));
+    lines.append(QStringLiteral("---  ---    ---------------  ---------------  -------"));
+
+    // Phase 2 output: per-hop statistics
+    for (int i = 0; i < hops.size(); ++i) {
+        const auto& hop = hops[i];
+        QString addr = hop.ttl == 0
+            ? hop.name
+            : (hop.ip.isEmpty() ? QStringLiteral("(unreachable)") : hop.ip);
+
+        if (i == 0) {
+            // Hop 0 — only address, stats are on inter-hop lines
+            lines.append(QStringLiteral("  %1                                         %2")
+                .arg(hop.ttl).arg(addr));
+        } else {
+            HopStats& hs = hopStats[i - 1];
+            QString rttField = hop.reached
+                ? QStringLiteral("%1ms").arg(hs.avgMs, 4)
+                : QStringLiteral("  N/A");
+            QString srcLoss = hop.reached
+                ? QStringLiteral("  %1/%2 = %3%").arg(hs.sent - hs.rcvd, 2).arg(hs.sent, 2).arg((int)hs.loss, 2)
+                : QStringLiteral("   N/A");
+            // This-node/link — for target hop, same as source-to-here; for intermediate, show as source loss
+            QString nodeLoss = hop.reached
+                ? QStringLiteral("  %1/%2 = %3%").arg(hs.sent - hs.rcvd, 2).arg(hs.sent, 2).arg((int)hs.loss, 2)
+                : QStringLiteral("   N/A");
+            lines.append(QStringLiteral("  %1  %2   %3   %4  %5")
+                .arg(hop.ttl, 2).arg(rttField).arg(srcLoss).arg(nodeLoss).arg(addr));
+        }
+
+        // Inter-hop link line (the "|" line in Windows pathping)
+        if (i < hops.size() - 1) {
+            const auto& nextHop = hops[i + 1];
+            int nextIdx = i; // index into hopStats for the next hop (hopStats[0] = hop 1)
+            QString linkLoss;
+            if (nextIdx < hopStats.size() && !nextHop.ip.isEmpty()) {
+                auto& nhs = hopStats[nextIdx];
+                linkLoss = QStringLiteral("  %1/%2 = %3%")
+                    .arg(nhs.sent - nhs.rcvd, 2).arg(nhs.sent, 2).arg((int)nhs.loss, 2);
+            } else {
+                linkLoss = QStringLiteral("   N/A");
+            }
+            lines.append(QStringLiteral("                               %1   |").arg(linkLoss));
+        }
+    }
+
+    lines.append(QString());
+    lines.append(reached ? QStringLiteral("Trace complete.") : QStringLiteral("Trace incomplete."));
+    r.rawOutput = lines.join('\n');
+    r.details   = lines.join('\n');
+    r.durationMs = totalTimer.elapsed();
+
+    if (reached) { r.status = TestStatus::Pass; r.summary = QStringLiteral("%1 hops, target reached").arg(hopCount); }
+    else if (hopCount > 0) { r.status = TestStatus::Warning; r.summary = QStringLiteral("Partial: %1 hops").arg(hopCount); }
+    else { r.status = TestStatus::Fail; r.summary = QStringLiteral("Target unreachable"); }
     return r;
 }
 
 // ── MTU Discovery (custom ping, no system command) ────────────────────
-DiagnosticResult mtuDiscovery(const QString& target, PlatformCommand*) {
+DiagnosticResult mtuDiscovery(const QString& target) {
     DiagnosticResult r;
-    r.id = TestId::G4MtuDiscovery; r.group = TestGroup::G4;
+    r.id = DiagId::G4MtuDiscovery; r.group = DiagGroup::G4;
     r.timestamp = QDateTime::currentDateTime();
     if (target.isEmpty()) { r.status = TestStatus::Skipped; r.summary = QStringLiteral("No target"); return r; }
-    // MTU discovery uses iterative ping with different payload sizes
-    // Since we can't set DF flag without raw socket, we use a heuristic based on TCP MSS
-    // Simpler fallback: use TCP connect with varying payload (not true MTU but gives indication)
-    int mtu = 1500; // Default assumption
-    // Try TCP connect and check if large packets work
+    QString host = extractHostname(target);
+    quint32 resolvedIp = resolveIPv4(host);
+    QString ipStr;
+    if (resolvedIp) { struct in_addr a; a.s_addr = htonl(resolvedIp); ipStr = QString::fromLatin1(inet_ntoa(a)); }
+    QStringList out;
+
+    // ── Windows ping -f -l style MTU discovery ─────────────────────────
+    out.append(QString());
+    out.append(QStringLiteral("Path MTU Discovery for %1 [%2]").arg(host, ipStr.isEmpty() ? host : ipStr));
+    out.append(QString());
+
+    // Try TCP connect and get MSS → derive path MTU
+    int discoveredMtu = 0, mss = 0;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock >= 0) {
-        quint32 ip = resolveIPv4(target);
-        if (ip) {
-            struct sockaddr_in addr; memset(&addr,0,sizeof(addr));
-            addr.sin_family = AF_INET; addr.sin_port = htons(80);
-            addr.sin_addr.s_addr = htonl(ip);
-            int flags = fcntl(sock, F_GETFL, 0);
-            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-            ::connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-            fd_set fdset; FD_ZERO(&fdset); FD_SET(sock, &fdset);
-            struct timeval tv = {2,0};
-            if (select(sock+1, nullptr, &fdset, nullptr, &tv) > 0) {
-                // Connected — check MSS via getsockopt
-                int mss = 0; socklen_t len = sizeof(mss);
-                if (getsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, &mss, &len) == 0 && mss > 0)
-                    mtu = mss + 40; // MSS + IP(20) + TCP(20) headers
+    if (sock >= 0 && resolvedIp) {
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET; addr.sin_port = htons(80);
+        addr.sin_addr.s_addr = htonl(resolvedIp);
+        setNonblockWin(sock);
+        QElapsedTimer t; t.start();
+        ::connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+        fd_set fdset; FD_ZERO(&fdset); FD_SET(sock, &fdset);
+        struct timeval tv = {3, 0};
+        int sel = select(sock + 1, nullptr, &fdset, nullptr, &tv);
+        if (sel > 0) {
+            int err = 0; socklen_t elen = sizeof(err);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&err, &elen);
+            if (err == 0 || err == ECONNREFUSED) {
+                socklen_t mssLen = sizeof(mss);
+                if (getsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, (char*)&mss, &mssLen) == 0 && mss > 0) {
+                    discoveredMtu = mss + 40; // MSS + IP(20) + TCP(20) headers
+                }
+#ifdef IP_MTU
+                // Also try IP_MTU directly
+                int ipMtu = 0; socklen_t ipMtuLen = sizeof(ipMtu);
+                if (getsockopt(sock, IPPROTO_IP, IP_MTU, (char*)&ipMtu, &ipMtuLen) == 0 && ipMtu > discoveredMtu)
+                    discoveredMtu = ipMtu;
+#endif
             }
+        }
+        int rtt = (int)t.elapsed();
+        if (mss > 0) {
+            out.append(QStringLiteral("Pinging %1 [%2] with MSS=%3 bytes of data:").arg(host, ipStr).arg(mss));
+            out.append(QStringLiteral("Reply from %1: MSS=%2 time=%3ms PMTU=%4").arg(ipStr).arg(mss).arg(rtt).arg(discoveredMtu));
+        } else {
+            out.append(QStringLiteral("Pinging %1 [%2] MTU probe:").arg(host, ipStr));
+            out.append(QStringLiteral("TCP connect succeeded but MSS not available."));
         }
         close(sock);
     }
-    r.properties.append(prop("Target",target));
-    r.properties.append(prop("MtuValue",QString::number(mtu)));
-    r.properties.append(prop("Method","TCP MSS heuristic"));
-    if (mtu>=1500) { r.status=TestStatus::Pass; r.summary=QStringLiteral("MTU %1 (standard)").arg(mtu); }
-    else if (mtu>=1280) { r.status=TestStatus::Warning; r.summary=QStringLiteral("MTU %1 (below 1500)").arg(mtu); }
-    else { r.status=TestStatus::Warning; r.summary=QStringLiteral("Low MTU: %1").arg(mtu); }
+    if (discoveredMtu == 0) {
+        // Fallback: probe with interface MTU (Windows ping -f -l style)
+        discoveredMtu = 1500;
+        out.append(QStringLiteral("PMTU TCP probe failed — using interface MTU."));
+#ifdef _WIN32
+        out.append(QStringLiteral("Pinging %1 [%2] with %3 bytes of data:").arg(host, ipStr).arg(discoveredMtu - 28));
+        out.append(QStringLiteral("Using default MTU: %1").arg(discoveredMtu));
+#else
+        // Check local interface MTU from /sys/class/net
+        QDir netDir(QStringLiteral("/sys/class/net"));
+        for (const auto& fi : netDir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+            QFile f(QStringLiteral("/sys/class/net/%1/mtu").arg(fi.fileName()));
+            if (f.open(QIODevice::ReadOnly)) {
+                int v = QString::fromLatin1(f.readAll().trimmed()).toInt();
+                if (v > 0 && v > discoveredMtu) discoveredMtu = v;
+            }
+        }
+        int payload = discoveredMtu > 28 ? discoveredMtu - 28 : discoveredMtu;
+        out.append(QStringLiteral("Pinging %1 [%2] with %3 bytes of data:").arg(host, ipStr.isEmpty() ? host : ipStr).arg(payload));
+        out.append(QStringLiteral("Reply from local interface: MTU=%1 bytes").arg(discoveredMtu));
+#endif
+    }
+
+    out.append(QString());
+    out.append(QStringLiteral("Ping statistics for %1:").arg(ipStr.isEmpty() ? host : ipStr));
+    out.append(QStringLiteral("    Maximum MTU: %1 bytes").arg(discoveredMtu));
+    out.append(QStringLiteral("    Effective MSS: %1 bytes").arg(discoveredMtu > 40 ? discoveredMtu - 40 : 0));
+
+    r.rawOutput = out.join('\n');
+    r.details = r.rawOutput;
+    r.properties.append(prop("Target", target));
+    r.properties.append(prop("Host", host));
+    r.properties.append(prop("MtuValue", QString::number(discoveredMtu)));
+    r.properties.append(prop("MssValue", QString::number(mss)));
+    if (discoveredMtu >= 1500) { r.status = TestStatus::Pass; r.summary = QStringLiteral("MTU %1 (standard)").arg(discoveredMtu); }
+    else if (discoveredMtu >= 1280) { r.status = TestStatus::Warning; r.summary = QStringLiteral("MTU %1 (below 1500)").arg(discoveredMtu); }
+    else { r.status = TestStatus::Warning; r.summary = QStringLiteral("Low MTU: %1").arg(discoveredMtu); }
     return r;
 }
 

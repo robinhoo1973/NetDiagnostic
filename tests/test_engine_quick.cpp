@@ -3,7 +3,6 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include "app/NativeService.h"
-#include "engine/PlatformCommand.h"
 #include "engine/diagnostic/DiagnosticEngine.h"
 #include "models/DiagnosticResult.h"
 #include "util/Logger.h"
@@ -18,16 +17,12 @@ int main(int argc, char* argv[]) {
     bool ok = ns.initialize();
     qDebug() << "Native plugin initialized:" << ok << "version:" << ns.version();
 
-    // 2. Create PlatformCommand
-    auto cmd = createPlatformCommand();
-    qDebug() << "PlatformCommand shell:" << cmd->shellExecutable();
+    // 2. Create DiagnosticEngine
+    DiagnosticEngine engine;
 
-    // 3. Create DiagnosticEngine
-    DiagnosticEngine engine(std::move(cmd));
-
-    // 4. Run a native test (G1 NetworkAdapters)
+    // 3. Run a native test (G1 NetworkAdapters)
     qDebug() << "Running G1 NetworkAdapters...";
-    auto future = engine.runTest(TestId::G1NetworkAdapters);
+    auto future = engine.runTest(DiagId::G1NetworkAdapters);
     future.waitForFinished();
     auto result = future.result();
     qDebug() << "  id:" << static_cast<int>(result.id)
@@ -35,9 +30,9 @@ int main(int argc, char* argv[]) {
              << "summary:" << result.summary
              << "durationMs:" << result.durationMs;
 
-    // 5. Run a non-native test (G5 URL parsing — should skip)
-    qDebug() << "Running G5 URL Parsing (no native, no Qt impl yet)...";
-    auto future2 = engine.runTest(TestId::G5UrlParsing, "https://example.com");
+    // 4. Run a non-native test (G5 URL parsing)
+    qDebug() << "Running G5 URL Parsing...";
+    auto future2 = engine.runTest(DiagId::G5UrlParsing, "https://example.com");
     future2.waitForFinished();
     auto result2 = future2.result();
     qDebug() << "  id:" << static_cast<int>(result2.id)

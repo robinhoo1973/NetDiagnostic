@@ -4,13 +4,32 @@
 #include <QVariantMap>
 #include <QIcon>
 #include <QTimer>
+#include <QLockFile>
+#include <QMessageBox>
+#include <QStandardPaths>
+#include <csignal>
 #include "app/AppState.h"
 
 int main(int argc, char *argv[])
 {
+    // Ignore SIGPIPE — raw ::send() on broken connections returns EPIPE
+    // instead of killing the process. The socket code checks errno after
+    // every send() call and handles EPIPE gracefully.
+    signal(SIGPIPE, SIG_IGN);
+
     // Use basic (single-threaded) render loop — more stable on ARM64
     qputenv("QSG_RENDER_LOOP", "basic");
     QGuiApplication app(argc, argv);
+
+    // ── Single instance via lock file ────────────────────────────────────
+    QString lockPath = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + QStringLiteral("/netanalysis.lock");
+    QLockFile lockFile(lockPath);
+    if (!lockFile.tryLock(100)) {
+        QMessageBox::information(nullptr, QStringLiteral("NetAnalysis"),
+            QStringLiteral("NetAnalysis is already running."));
+        return 0;
+    }
+
     app.setApplicationName("NetAnalysis");
     app.setApplicationDisplayName("NetAnalysis");
     app.setApplicationVersion("1.0.0");

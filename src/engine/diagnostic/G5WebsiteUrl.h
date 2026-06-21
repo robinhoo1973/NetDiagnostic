@@ -6,8 +6,6 @@
 #include <QString>
 #include "models/DiagnosticResult.h"
 
-class PlatformCommand;
-
 namespace G5WebsiteUrl {
 
 DiagnosticResult urlParsing(const QString& target);
