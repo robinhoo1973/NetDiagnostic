@@ -1,0 +1,36 @@
+# Build outputs
+dist/
+build/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+moc_*
+qrc_*
+Makefile
+*.ninja
+.ninja_*
+
+# IDE
+.vscode/
+.idea/
+*.pro.user
+*.swp
+*.swo
+*~
+
+# Agent state (not part of project)
+.deepseek/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# External binaries (not part of project)
+codewhale
+codewhale-tui
