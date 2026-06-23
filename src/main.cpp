@@ -6,6 +6,7 @@
 #include <QTimer>
 #include <QMessageBox>
 #include <QStandardPaths>
+#include <QLockFile>
 #include <csignal>
 #include <curl/curl.h>
 #include "app/AppState.h"
