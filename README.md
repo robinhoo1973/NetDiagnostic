@@ -249,13 +249,12 @@ ND_MAX_TESTS=2 ND_AUTORUN=1 QT_QPA_PLATFORM=offscreen \
 
 ### TestFlight (iOS)
 
-Automated deployment via `.github/workflows/deploy-testflight.yml`. This workflow:
+Fully automated deployment via `.github/workflows/deploy-testflight.yml`. The workflow handles everything — no manual Apple Developer Portal steps needed.
 
-1. Checks whether the `NetDiagnostic` app exists in App Store Connect — creates it if not
-2. Builds the iOS `.app` with Qt 6 + Xcode
-3. Code-signs with your distribution certificate
-4. Exports a signed `.ipa`
-5. Uploads to TestFlight via `altool`
+**What it auto-creates (first run only, skips if exists):**
+1. **Bundle ID** `com.netdiagnostic.app` in Apple Developer Portal
+2. **App Store Connect app** named `NetDiagnostic`
+3. **App Store Provisioning Profile** linked to your distribution certificate
 
 #### Triggers
 
@@ -264,40 +263,36 @@ Automated deployment via `.github/workflows/deploy-testflight.yml`. This workflo
 
 #### Required GitHub Secrets
 
+Only **6 secrets** needed (5 for first-time, `IOS_PROVISIONING_PROFILE_BASE64` is optional):
+
 | Secret | How to obtain |
 |--------|---------------|
 | `APPSTORE_CONNECT_ISSUER_ID` | App Store Connect → Users and Access → Integrations → Keys |
 | `APPSTORE_CONNECT_KEY_ID` | Same page — displayed alongside Issuer ID |
-| `APPSTORE_CONNECT_API_KEY` | Downloaded `.p8` file content (include `-----BEGIN/END PRIVATE KEY-----`) |
+| `APPSTORE_CONNECT_API_KEY` | Downloaded `.p8` file content |
 | `IOS_TEAM_ID` | [developer.apple.com/account](https://developer.apple.com/account) → Membership |
 | `IOS_DISTRIBUTION_CERT_BASE64` | `base64 -i dist.p12 \| tr -d '\n'` |
 | `IOS_DISTRIBUTION_CERT_PASSWORD` | Password set when exporting `.p12` from Keychain |
-| `IOS_PROVISIONING_PROFILE_BASE64` | `base64 -i profile.mobileprovision \| tr -d '\n'` |
+| `IOS_PROVISIONING_PROFILE_BASE64` | *(Optional)* Skip auto-creation by providing your own |
 
-#### One-time setup
+#### One-time manual setup (only the cert)
 
-**1. Register Bundle ID** (do this once):
-- Go to [Apple Developer → Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/identifiers/list)
-- Click **+** → **App IDs** → **App**
-- Description: `NetDiagnostic`, Bundle ID: `com.robinhu.netdiagnostic`
-- Enable any capabilities you need, then **Register**
-
-**2. Create Distribution Certificate** (do this once):
+**1. Create Distribution Certificate** (the ONLY manual step):
 - Xcode → Settings → Accounts → your Apple ID → Manage Certificates
 - Click **+** → **Apple Distribution**
-- Or via Keychain Access → Certificate Assistant → Request a Certificate from a Certificate Authority, then upload to Developer Portal
 
-**3. Export .p12 from Keychain** (do this once):
+**2. Export .p12 from Keychain**:
 - Open Keychain Access → find your **Apple Distribution** certificate
 - Right-click → Export → `.p12` format → set a password
-- Encode: `base64 -i dist.p12 | tr -d '\n'` → paste into `IOS_DISTRIBUTION_CERT_BASE64` secret
+- `base64 -i dist.p12 | tr -d '\n'` → paste into `IOS_DISTRIBUTION_CERT_BASE64`
+- Password → paste into `IOS_DISTRIBUTION_CERT_PASSWORD`
 
-**4. Create App Store Provisioning Profile** (regenerate when cert changes):
-- [Developer Portal → Profiles](https://developer.apple.com/account/resources/profiles/list) → **+**
-- Type: **App Store**, App ID: `NetDiagnostic`, Certificate: select your distribution cert
-- Download, then encode: `base64 -i profile.mobileprovision | tr -d '\n'` → paste into `IOS_PROVISIONING_PROFILE_BASE64` secret
+**3. Create App Store Connect API Key** (Developer permission is sufficient):
+- App Store Connect → Users and Access → Integrations → Keys → **+**
+- Name: `CI-Upload-Key`, Access: **Developer**
+- Save the Issuer ID, Key ID, and downloaded `.p8` file
 
-**5. Create App Store Connect API Key** (already covered above).
+Everything else (Bundle ID, App Store Connect app, Provisioning Profile) is auto-created on first workflow run.
 
 #### Verification
 

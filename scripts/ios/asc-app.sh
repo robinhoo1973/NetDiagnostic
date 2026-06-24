@@ -133,18 +133,237 @@ asc_app_ensure() {
 }
 
 # ─────────────────────────────────────────────────────────────────────
+# Bundle ID management
+# ─────────────────────────────────────────────────────────────────────
+asc_bundle_find() {
+    local jwt="$1"
+    local identifier="$2"
+
+    local resp
+    resp=$(curl -s -X GET "${ASC_API}/bundleIds?filter[identifier]=${identifier}" \
+        -H "Authorization: Bearer ${jwt}" \
+        -H "Accept: application/json")
+
+    local bid
+    bid=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',[{}])[0].get('id',''))" 2>/dev/null || echo "")
+    echo "$bid"
+}
+
+asc_bundle_create() {
+    local jwt="$1"
+    local name="$2"
+    local identifier="$3"
+    local platform="${4:-IOS}"
+
+    local payload
+    payload=$(cat <<ENDJSON
+{
+  "data": {
+    "type": "bundleIds",
+    "attributes": {
+      "name": "${name}",
+      "identifier": "${identifier}",
+      "platform": "${platform}"
+    }
+  }
+}
+ENDJSON
+)
+
+    local resp
+    resp=$(curl -s -w "\n%{http_code}" -X POST "${ASC_API}/bundleIds" \
+        -H "Authorization: Bearer ${jwt}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d "$payload")
+
+    local http_code
+    http_code=$(echo "$resp" | tail -1)
+    local body
+    body=$(echo "$resp" | sed '$d')
+
+    if [ "$http_code" != "201" ] && [ "$http_code" != "200" ]; then
+        echo "ERROR: failed to create bundle ID (HTTP ${http_code}): ${body}" >&2
+        return 1
+    fi
+
+    local bid
+    bid=$(echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['id'])")
+    echo "$bid"
+}
+
+asc_bundle_ensure() {
+    local jwt="$1"
+    local name="$2"
+    local identifier="$3"
+
+    local bid
+    bid=$(asc_bundle_find "$jwt" "$identifier")
+
+    if [ -n "$bid" ]; then
+        echo "Bundle ID already registered: id=${bid}" >&2
+        echo "$bid"
+        return 0
+    fi
+
+    echo "Bundle ID not found, registering: name=${name} id=${identifier}..." >&2
+    bid=$(asc_bundle_create "$jwt" "$name" "$identifier")
+    echo "Registered bundle ID: id=${bid}" >&2
+    echo "$bid"
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Certificate lookup
+# ─────────────────────────────────────────────────────────────────────
+asc_cert_find_distribution() {
+    local jwt="$1"
+
+    local resp
+    resp=$(curl -s -X GET "${ASC_API}/certificates?filter[certificateType]=IOS_DISTRIBUTION&sort=-displayName&limit=1" \
+        -H "Authorization: Bearer ${jwt}" \
+        -H "Accept: application/json")
+
+    local cid
+    cid=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',[{}])[0].get('id',''))" 2>/dev/null || echo "")
+    echo "$cid"
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Provisioning profile management
+# ─────────────────────────────────────────────────────────────────────
+asc_profile_find() {
+    local jwt="$1"
+    local profile_name="$2"
+
+    local resp
+    resp=$(curl -s -X GET "${ASC_API}/profiles?filter[name]=${profile_name}&filter[profileType]=IOS_APP_STORE&limit=1" \
+        -H "Authorization: Bearer ${jwt}" \
+        -H "Accept: application/json")
+
+    local pid
+    pid=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',[{}])[0].get('id',''))" 2>/dev/null || echo "")
+    echo "$pid"
+}
+
+asc_profile_create() {
+    local jwt="$1"
+    local profile_name="$2"
+    local bundle_id="$3"
+    local cert_id="$4"
+
+    local payload
+    payload=$(cat <<ENDJSON
+{
+  "data": {
+    "type": "profiles",
+    "attributes": {
+      "name": "${profile_name}",
+      "profileType": "IOS_APP_STORE"
+    },
+    "relationships": {
+      "bundleId": {
+        "data": { "type": "bundleIds", "id": "${bundle_id}" }
+      },
+      "certificates": {
+        "data": [ { "type": "certificates", "id": "${cert_id}" } ]
+      }
+    }
+  }
+}
+ENDJSON
+)
+
+    local resp
+    resp=$(curl -s -w "\n%{http_code}" -X POST "${ASC_API}/profiles" \
+        -H "Authorization: Bearer ${jwt}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d "$payload")
+
+    local http_code
+    http_code=$(echo "$resp" | tail -1)
+    local body
+    body=$(echo "$resp" | sed '$d')
+
+    if [ "$http_code" != "201" ] && [ "$http_code" != "200" ]; then
+        echo "ERROR: failed to create provisioning profile (HTTP ${http_code}): ${body}" >&2
+        return 1
+    fi
+
+    local pid
+    pid=$(echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['id'])")
+    echo "$pid"
+}
+
+asc_profile_ensure() {
+    local jwt="$1"
+    local profile_name="$2"
+    local bundle_id="$3"
+    local cert_id="$4"
+
+    local pid
+    pid=$(asc_profile_find "$jwt" "$profile_name")
+
+    if [ -n "$pid" ]; then
+        echo "Provisioning profile exists: id=${pid}" >&2
+        echo "$pid"
+        return 0
+    fi
+
+    echo "Provisioning profile not found, creating: ${profile_name}..." >&2
+    pid=$(asc_profile_create "$jwt" "$profile_name" "$bundle_id" "$cert_id")
+
+    # Provisioning profile creation returns the profile object
+    # We need to download the actual .mobileprovision file content
+    echo "Created provisioning profile: id=${pid}" >&2
+    echo "$pid"
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Download provisioning profile data (base64-encoded content)
+# ─────────────────────────────────────────────────────────────────────
+asc_profile_download() {
+    local jwt="$1"
+    local profile_id="$2"
+
+    local resp
+    resp=$(curl -s -X GET "${ASC_API}/profiles/${profile_id}" \
+        -H "Authorization: Bearer ${jwt}" \
+        -H "Accept: application/json" \
+        -H "fields[profiles]=profileContent")
+
+    local content
+    content=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['attributes'].get('profileContent',''))" 2>/dev/null || echo "")
+
+    if [ -z "$content" ]; then
+        echo "ERROR: failed to download provisioning profile content" >&2
+        return 1
+    fi
+
+    echo "$content"
+}
+
+# ─────────────────────────────────────────────────────────────────────
 # When executed directly (not sourced), run the requested function
 # ─────────────────────────────────────────────────────────────────────
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     CMD="${1:-}"
     shift 2>/dev/null || true
     case "$CMD" in
-        jwt)          asc_jwt "$@" ;;
-        find)         asc_app_find "$@" ;;
-        create)       asc_app_create "$@" ;;
-        ensure)       asc_app_ensure "$@" ;;
+        jwt)              asc_jwt "$@" ;;
+        app-find)         asc_app_find "$@" ;;
+        app-create)       asc_app_create "$@" ;;
+        app-ensure)       asc_app_ensure "$@" ;;
+        bundle-find)      asc_bundle_find "$@" ;;
+        bundle-create)    asc_bundle_create "$@" ;;
+        bundle-ensure)    asc_bundle_ensure "$@" ;;
+        cert-dist)        asc_cert_find_distribution "$@" ;;
+        profile-find)     asc_profile_find "$@" ;;
+        profile-create)   asc_profile_create "$@" ;;
+        profile-ensure)   asc_profile_ensure "$@" ;;
+        profile-download) asc_profile_download "$@" ;;
         *)
-            echo "Usage: $0 {jwt|find|create|ensure} [args...]" >&2
+            echo "Usage: $0 {jwt|app-find|app-create|app-ensure|bundle-find|bundle-create|bundle-ensure|cert-dist|profile-find|profile-create|profile-ensure|profile-download} [args...]" >&2
             exit 1
             ;;
     esac

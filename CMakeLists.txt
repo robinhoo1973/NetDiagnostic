@@ -95,10 +95,24 @@ endif()
 if(IOS)
     set_target_properties(net_diagnostic PROPERTIES
         MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/resources/Info.plist"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.netdiagnostic.app"
         MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_COPYRIGHT "Copyright © Robin Hu. All rights reserved."
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.netdiagnostic.app"
     )
+    # Code signing: manual in CI, automatic on developer machines
+    if(DEFINED ENV{IOS_TEAM_ID})
+        set_target_properties(net_diagnostic PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Manual"
+            XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "$ENV{IOS_TEAM_ID}"
+        )
+    else()
+        set_target_properties(net_diagnostic PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+        )
+    endif()
 endif()
 
 target_link_libraries(net_diagnostic PRIVATE

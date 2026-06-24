@@ -36,6 +36,10 @@ desktop.ini
 # Temporary files
 .goutputstream-*
 xa-tmp*/
+...
 
 # Backup files
 *.bak
+
+# Certificates — entire directory excluded (private keys, certs, CSR)
+resources/cert/

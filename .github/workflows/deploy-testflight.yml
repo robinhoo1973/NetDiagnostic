@@ -1,12 +1,10 @@
 name: Deploy iOS to TestFlight
 
 on:
-  # Trigger after the main Build & Release workflow succeeds
   workflow_run:
     workflows: ["Build & Release"]
     types: [completed]
     branches: [master]
-  # Allow manual trigger (for testing / first-time setup)
   workflow_dispatch:
 
 concurrency:
@@ -17,45 +15,41 @@ permissions:
   contents: read
 
 jobs:
-  # ═══════════════════════════════════════════════════════════════════════
-  # Single job: check/create app → build → sign → upload
-  # ═══════════════════════════════════════════════════════════════════════
   deploy-ios:
     name: Deploy iOS to TestFlight
     runs-on: macos-latest
-    # Only run when the triggering build workflow succeeded, or on manual dispatch
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
 
     env:
       QT_VERSION: "6.5.3"
-      BUNDLE_ID: "com.robinhu.netdiagnostic"
+      BUNDLE_ID: "com.netdiagnostic.app"
       APP_NAME: "NetDiagnostic"
       APP_SKU: "netdiag.ios.001"
       APP_LOCALE: "en-US"
+      PROFILE_NAME: "NetDiagnostic AppStore"
       QT_INSTALL_DIR: "/opt/qt-ios"
-      ASC_KEY_DIR: "/tmp/asc-keys"
 
     steps:
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
       # Checkout
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
       - uses: actions/checkout@v4
 
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
       # Install build tools
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
       - name: Install homebrew dependencies
         run: brew install cmake ninja curl python3
 
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
       # Cache & install Qt 6 for iOS
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
       - name: Cache Qt 6 iOS
         id: cache-qt-ios
         uses: actions/cache@v4
         with:
           path: ${{ env.QT_INSTALL_DIR }}
-          key: qt6-ios-${{ env.QT_VERSION }}-v2
+          key: qt6-ios-${{ env.QT_VERSION }}-v3
 
       - name: Install Qt 6 for iOS via aqt
         if: steps.cache-qt-ios.outputs.cache-hit != 'true'
@@ -63,42 +57,67 @@ jobs:
           pip3 install aqtinstall
           aqt install-qt mac ios $QT_VERSION ios -O $QT_INSTALL_DIR
 
-      # ─────────────────────────────────────────────────────────────────
-      # Write ASC private key to file
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
+      # Write ASC private key to disk
+      # ═════════════════════════════════════════════════════════════════
       - name: Prepare App Store Connect key
         run: |
-          mkdir -p "$ASC_KEY_DIR"
-          echo "${{ secrets.APPSTORE_CONNECT_API_KEY }}" > "$ASC_KEY_DIR/key.p8"
-          chmod 600 "$ASC_KEY_DIR/key.p8"
+          KEYFILE="$RUNNER_TEMP/asc-key.p8"
+          echo "${{ secrets.APPSTORE_CONNECT_API_KEY }}" > "$KEYFILE"
+          chmod 600 "$KEYFILE"
+          echo "ASC_KEYFILE=${KEYFILE}" >> "$GITHUB_ENV"
 
-      # ─────────────────────────────────────────────────────────────────
-      # Generate JWT & ensure app exists in App Store Connect
-      # ─────────────────────────────────────────────────────────────────
-      - name: Ensure App Store Connect app exists
-        id: asc-app
+      # ═════════════════════════════════════════════════════════════════
+      # Generate JWT (used by all subsequent ASC API calls)
+      # ═════════════════════════════════════════════════════════════════
+      - name: Generate App Store Connect JWT
+        id: jwt
         run: |
           source scripts/ios/asc-app.sh
-
-          echo "Generating JWT..."
           JWT=$(asc_jwt \
             "${{ secrets.APPSTORE_CONNECT_KEY_ID }}" \
             "${{ secrets.APPSTORE_CONNECT_ISSUER_ID }}" \
-            "$ASC_KEY_DIR/key.p8")
+            "$ASC_KEYFILE")
+          echo "jwt=${JWT}" >> "$GITHUB_OUTPUT"
+          echo "✅ JWT generated"
 
-          echo "Checking / creating App Store Connect app..."
+      # ═════════════════════════════════════════════════════════════════
+      # Step A: Register Bundle ID in Developer Portal (if not exists)
+      # ═════════════════════════════════════════════════════════════════
+      - name: Register Bundle ID (auto)
+        id: bundle
+        run: |
+          source scripts/ios/asc-app.sh
+          JWT="${{ steps.jwt.outputs.jwt }}"
+
+          echo "Checking bundle ID: ${BUNDLE_ID}..."
+          BID=$(asc_bundle_ensure "$JWT" "$APP_NAME" "$BUNDLE_ID")
+
+          echo "bundle_id=${BID}" >> "$GITHUB_OUTPUT"
+          echo "✅ Bundle ID ready (id: ${BID})"
+
+      # ═════════════════════════════════════════════════════════════════
+      # Step B: Ensure App exists in App Store Connect (if not exists)
+      # ═════════════════════════════════════════════════════════════════
+      - name: Ensure App Store Connect app (auto)
+        id: asc-app
+        run: |
+          source scripts/ios/asc-app.sh
+          JWT="${{ steps.jwt.outputs.jwt }}"
+
+          echo "Checking App Store Connect app: ${APP_NAME}..."
           APP_ID=$(asc_app_ensure "$JWT" "$APP_NAME" "$BUNDLE_ID" "$APP_SKU" "$APP_LOCALE")
 
           echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
           echo "✅ App Store Connect app ready (id: ${APP_ID})"
 
-      # ─────────────────────────────────────────────────────────────────
-      # Import code signing certificate
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
+      # Import iOS Distribution Certificate (.p12) into keychain
+      # (User must provide this — private keys can't be auto-generated)
+      # ═════════════════════════════════════════════════════════════════
       - name: Import iOS distribution certificate
         run: |
-          # Create temporary keychain
-          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
           KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
@@ -106,55 +125,104 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 
-          # Decode and import distribution certificate (.p12)
-          echo "${{ secrets.IOS_DISTRIBUTION_CERT_BASE64 }}" | base64 -d > "$RUNNER_TEMP/dist-cert.p12"
+          echo "${{ secrets.IOS_DISTRIBUTION_CERT_BASE64 }}" \
+            | base64 -d > "$RUNNER_TEMP/dist-cert.p12"
+
           security import "$RUNNER_TEMP/dist-cert.p12" \
             -k "$KEYCHAIN_PATH" \
             -P "${{ secrets.IOS_DISTRIBUTION_CERT_PASSWORD }}" \
             -A -T /usr/bin/codesign -T /usr/bin/xcodebuild
 
-          # Allow codesign to access the keychain without prompt
           security set-key-partition-list -S apple-tool:,apple: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null 2>&1
 
           echo "✅ Distribution certificate imported"
 
-      # ─────────────────────────────────────────────────────────────────
-      # Install provisioning profile
-      # ─────────────────────────────────────────────────────────────────
-      - name: Install provisioning profile
+      # ═════════════════════════════════════════════════════════════════
+      # Step C: Look up the Distribution Certificate ID in Developer Portal
+      # ═════════════════════════════════════════════════════════════════
+      - name: Find distribution certificate in Developer Portal
+        id: cert-id
         run: |
-          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
-          mkdir -p "$PROFILE_DIR"
+          source scripts/ios/asc-app.sh
+          JWT="${{ steps.jwt.outputs.jwt }}"
 
-          echo "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
+          CERT_ID=$(asc_cert_find_distribution "$JWT")
 
-          # Extract UUID from provisioning profile
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin \
-            <<< "$(security cms -D -i "$RUNNER_TEMP/profile.mobileprovision")" 2>/dev/null)
-
-          if [ -z "$PROFILE_UUID" ]; then
-            # Fallback: use grep to extract UUID if PlistBuddy fails
-            PROFILE_UUID=$(grep -a -A 1 "UUID" "$RUNNER_TEMP/profile.mobileprovision" \
-              | grep string | head -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+          if [ -z "$CERT_ID" ]; then
+            echo "ERROR: No IOS_DISTRIBUTION certificate found in Developer Portal."
+            echo "Make sure you have created a distribution certificate at:"
+            echo "  https://developer.apple.com/account/resources/certificates/list"
+            exit 1
           fi
 
+          echo "cert_id=${CERT_ID}" >> "$GITHUB_OUTPUT"
+          echo "✅ Distribution certificate found (id: ${CERT_ID})"
+
+      # ═════════════════════════════════════════════════════════════════
+      # Step D: Create provisioning profile (auto, if not exists)
+      # Falls back to user-provided profile if ASC API creation fails
+      # ═════════════════════════════════════════════════════════════════
+      - name: Ensure provisioning profile (auto)
+        id: profile
+        run: |
+          source scripts/ios/asc-app.sh
+          JWT="${{ steps.jwt.outputs.jwt }}"
+          BID="${{ steps.bundle.outputs.bundle_id }}"
+          CID="${{ steps.cert-id.outputs.cert_id }}"
+
+          # First, try user-provided profile (optional — for users who prefer manual)
+          if [ -n "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" ]; then
+            echo "Using user-provided provisioning profile..."
+            echo "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" \
+              | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
+            PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin \
+              <<< "$(security cms -D -i "$RUNNER_TEMP/profile.mobileprovision")" 2>/dev/null)
+            PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+            mkdir -p "$PROFILE_DIR"
+            cp "$RUNNER_TEMP/profile.mobileprovision" "$PROFILE_DIR/${PROFILE_UUID}.mobileprovision"
+            echo "profile_uuid=${PROFILE_UUID}" >> "$GITHUB_OUTPUT"
+            echo "✅ Using user-provided provisioning profile (UUID: ${PROFILE_UUID})"
+            exit 0
+          fi
+
+          # Auto-create profile via ASC API
+          echo "Auto-creating provisioning profile: ${PROFILE_NAME}..."
+          PROFILE_ID=$(asc_profile_ensure "$JWT" "$PROFILE_NAME" "$BID" "$CID")
+          echo "Profile ID: ${PROFILE_ID}"
+
+          # Download the .mobileprovision content
+          echo "Downloading provisioning profile content..."
+          PROFILE_B64=$(asc_profile_download "$JWT" "$PROFILE_ID")
+
+          if [ -z "$PROFILE_B64" ]; then
+            echo "ERROR: Failed to download provisioning profile."
+            echo "You can manually create and provide IOS_PROVISIONING_PROFILE_BASE64 secret."
+            exit 1
+          fi
+
+          # Decode and install
+          echo "$PROFILE_B64" | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin \
+            <<< "$(security cms -D -i "$RUNNER_TEMP/profile.mobileprovision")" 2>/dev/null)
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILE_DIR"
           cp "$RUNNER_TEMP/profile.mobileprovision" "$PROFILE_DIR/${PROFILE_UUID}.mobileprovision"
 
           echo "profile_uuid=${PROFILE_UUID}" >> "$GITHUB_OUTPUT"
-          echo "✅ Provisioning profile installed (UUID: ${PROFILE_UUID})"
-        id: profile
+          echo "✅ Provisioning profile auto-created and installed (UUID: ${PROFILE_UUID})"
 
-      # ─────────────────────────────────────────────────────────────────
-      # Configure CMake for iOS (Xcode generator required for signing)
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
+      # Configure CMake for iOS (Xcode generator)
+      # ═════════════════════════════════════════════════════════════════
       - name: Configure CMake for iOS
         run: |
-          export PATH="$QT_INSTALL_DIR/$QT_VERSION/ios/bin:$PATH"
+          QT_IOS="$QT_INSTALL_DIR/$QT_VERSION/ios"
+          export PATH="$QT_IOS/bin:$PATH"
 
           cmake -G Xcode \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$QT_INSTALL_DIR/$QT_VERSION/ios" \
+            -DCMAKE_PREFIX_PATH="$QT_IOS" \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES="arm64" \
@@ -162,9 +230,9 @@ jobs:
 
           echo "✅ CMake configured"
 
-      # ─────────────────────────────────────────────────────────────────
-      # Build iOS app (archive)
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
+      # Archive (build + sign)
+      # ═════════════════════════════════════════════════════════════════
       - name: Build and archive iOS app
         run: |
           xcodebuild archive \
@@ -174,21 +242,22 @@ jobs:
             -configuration Release \
             -archivePath build-ios/NetDiagnostic.xcarchive \
             DEVELOPMENT_TEAM="${{ secrets.IOS_TEAM_ID }}" \
-            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_STYLE="Manual" \
             PROVISIONING_PROFILE_SPECIFIER="${{ steps.profile.outputs.profile_uuid }}" \
             CODE_SIGN_IDENTITY="iPhone Distribution" \
-            -verbose 2>&1 | tail -100
+            -verbose 2>&1 | tail -120
 
           echo "✅ Archive created"
 
-      # ─────────────────────────────────────────────────────────────────
-      # Generate ExportOptions.plist dynamically
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
+      # Generate ExportOptions.plist
+      # ═════════════════════════════════════════════════════════════════
       - name: Generate ExportOptions.plist
         run: |
           cat > build-ios/ExportOptions.plist << PLISTEOF
       <?xml version="1.0" encoding="UTF-8"?>
-      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
       <plist version="1.0">
       <dict>
           <key>method</key>
@@ -211,9 +280,9 @@ jobs:
       PLISTEOF
           echo "✅ ExportOptions.plist generated"
 
-      # ─────────────────────────────────────────────────────────────────
-      # Export IPA
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
+      # Export .ipa
+      # ═════════════════════════════════════════════════════════════════
       - name: Export IPA
         run: |
           xcodebuild -exportArchive \
@@ -225,9 +294,9 @@ jobs:
           echo "✅ IPA exported"
           ls -lh build-ios/output/
 
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
       # Upload to TestFlight via altool
-      # ─────────────────────────────────────────────────────────────────
+      # ═════════════════════════════════════════════════════════════════
       - name: Upload to TestFlight
         run: |
           IPA_PATH=$(find build-ios/output -name "*.ipa" | head -1)
@@ -240,9 +309,8 @@ jobs:
 
           echo "Uploading ${IPA_PATH} to TestFlight..."
 
-          # Write key to Apple's expected location
           mkdir -p ~/.appstoreconnect/private_keys
-          cp "$ASC_KEY_DIR/key.p8" \
+          cp "$ASC_KEYFILE" \
             ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPSTORE_CONNECT_KEY_ID }}.p8
 
           xcrun altool --upload-app \
@@ -252,13 +320,13 @@ jobs:
             --apiIssuer "${{ secrets.APPSTORE_CONNECT_ISSUER_ID }}" \
             --verbose
 
-          echo "✅ Uploaded to TestFlight — check App Store Connect for processing status"
+          echo "✅ Uploaded to TestFlight"
 
-      # ─────────────────────────────────────────────────────────────────
-      # Clean up key files
-      # ─────────────────────────────────────────────────────────────────
-      - name: Clean up
+      # ═════════════════════════════════════════════════════════════════
+      # Clean up sensitive key material (always)
+      # ═════════════════════════════════════════════════════════════════
+      - name: Clean up keys
         if: always()
         run: |
-          rm -rf "$ASC_KEY_DIR"
-          rm -f ~/.appstoreconnect/private_keys/AuthKey_*.p8
+          rm -f "$ASC_KEYFILE" 2>/dev/null || true
+          rm -f ~/.appstoreconnect/private_keys/AuthKey_*.p8 2>/dev/null || true
