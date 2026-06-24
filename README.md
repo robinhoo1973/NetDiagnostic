@@ -35,7 +35,8 @@ Cross-platform network diagnostic tool. Built with Qt 6 / QML and libcurl.
 NetDiagnostic-QT/
 ├── CMakeLists.txt              # Build configuration
 ├── README.md                   # This file
-├── PROJECT_CHANGES.md          # Complete file manifest & change log
+├── doc/
+│   ├── PROJECT_CHANGES.md      # Complete file manifest & change log
 ├── .gitignore
 ├── scripts/
 │   ├── build-all.sh            # Self-contained multi-platform build system
@@ -242,6 +243,65 @@ ND_MAX_TESTS=2 ND_AUTORUN=1 QT_QPA_PLATFORM=offscreen \
 | Linux | resolv (DNS), glibc |
 | Windows | ws2_32, winhttp, iphlpapi, wlanapi, dnsapi, ole32, shell32 |
 | macOS | resolv (DNS), SystemConfiguration, CoreFoundation |
+| iOS | libcurl, resolv (DNS), SystemConfiguration |
+
+## Deployment
+
+### TestFlight (iOS)
+
+Automated deployment via `.github/workflows/deploy-testflight.yml`. This workflow:
+
+1. Checks whether the `NetDiagnostic` app exists in App Store Connect — creates it if not
+2. Builds the iOS `.app` with Qt 6 + Xcode
+3. Code-signs with your distribution certificate
+4. Exports a signed `.ipa`
+5. Uploads to TestFlight via `altool`
+
+#### Triggers
+
+- **Automatic:** after the `Build & Release` workflow succeeds on `master`
+- **Manual:** `workflow_dispatch` from GitHub Actions UI
+
+#### Required GitHub Secrets
+
+| Secret | How to obtain |
+|--------|---------------|
+| `APPSTORE_CONNECT_ISSUER_ID` | App Store Connect → Users and Access → Integrations → Keys |
+| `APPSTORE_CONNECT_KEY_ID` | Same page — displayed alongside Issuer ID |
+| `APPSTORE_CONNECT_API_KEY` | Downloaded `.p8` file content (include `-----BEGIN/END PRIVATE KEY-----`) |
+| `IOS_TEAM_ID` | [developer.apple.com/account](https://developer.apple.com/account) → Membership |
+| `IOS_DISTRIBUTION_CERT_BASE64` | `base64 -i dist.p12 \| tr -d '\n'` |
+| `IOS_DISTRIBUTION_CERT_PASSWORD` | Password set when exporting `.p12` from Keychain |
+| `IOS_PROVISIONING_PROFILE_BASE64` | `base64 -i profile.mobileprovision \| tr -d '\n'` |
+
+#### One-time setup
+
+**1. Register Bundle ID** (do this once):
+- Go to [Apple Developer → Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/identifiers/list)
+- Click **+** → **App IDs** → **App**
+- Description: `NetDiagnostic`, Bundle ID: `com.robinhu.netdiagnostic`
+- Enable any capabilities you need, then **Register**
+
+**2. Create Distribution Certificate** (do this once):
+- Xcode → Settings → Accounts → your Apple ID → Manage Certificates
+- Click **+** → **Apple Distribution**
+- Or via Keychain Access → Certificate Assistant → Request a Certificate from a Certificate Authority, then upload to Developer Portal
+
+**3. Export .p12 from Keychain** (do this once):
+- Open Keychain Access → find your **Apple Distribution** certificate
+- Right-click → Export → `.p12` format → set a password
+- Encode: `base64 -i dist.p12 | tr -d '\n'` → paste into `IOS_DISTRIBUTION_CERT_BASE64` secret
+
+**4. Create App Store Provisioning Profile** (regenerate when cert changes):
+- [Developer Portal → Profiles](https://developer.apple.com/account/resources/profiles/list) → **+**
+- Type: **App Store**, App ID: `NetDiagnostic`, Certificate: select your distribution cert
+- Download, then encode: `base64 -i profile.mobileprovision | tr -d '\n'` → paste into `IOS_PROVISIONING_PROFILE_BASE64` secret
+
+**5. Create App Store Connect API Key** (already covered above).
+
+#### Verification
+
+After the workflow succeeds, check [App Store Connect → TestFlight](https://appstoreconnect.apple.com). The build will appear after ~15-30 minutes of processing. Add internal testers (up to 100, no review needed) or external testers (requires Beta App Review).
 
 ## License
 

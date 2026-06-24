@@ -32,3 +32,10 @@ desktop.ini
 # Session files
 .codewhale/
 .deepseek/
+
+# Temporary files
+.goutputstream-*
+xa-tmp*/
+
+# Backup files
+*.bak

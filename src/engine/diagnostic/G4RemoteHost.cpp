@@ -1,4 +1,8 @@
-﻿#include "engine/diagnostic/G4RemoteHost.h"
+﻿#ifdef _MSC_VER
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
+#include "engine/diagnostic/G4RemoteHost.h"
 #include "util/DebugSwitch.h"
 #include "util/PingParser.h"
 #include "util/Logger.h"
@@ -354,10 +358,10 @@ DiagnosticResult dnsResolution(const QString& target) {
 
     // ── Footer ──────────────────────────────────────────────────────────
     out.append(QStringLiteral(";; Query time: %1 msec").arg(t.elapsed()));
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
     out.append(QStringLiteral(";; SERVER: system resolver"));
 #else
-    // Show actual resolver address from _res
+    // Show actual resolver address from _res (glibc-specific)
     QStringList nsList;
     for (int i = 0; i < MAXNS && _res.nsaddr_list[i].sin_addr.s_addr != 0; i++)
         nsList.append(QString::fromLatin1(inet_ntoa(_res.nsaddr_list[i].sin_addr)));
