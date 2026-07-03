@@ -399,12 +399,31 @@ jobs:
           cp "$ASC_KEYFILE" \
             ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPSTORE_CONNECT_KEY_ID }}.p8
 
+          UPLOAD_LOG="$RUNNER_TEMP/altool-upload.log"
+          set +e
           xcrun altool --upload-app \
             -f NetDiagnostic-iOS.ipa \
             -t ios \
             --apiKey "${{ secrets.APPSTORE_CONNECT_KEY_ID }}" \
             --apiIssuer "${{ secrets.APPSTORE_CONNECT_ISSUER_ID }}" \
-            --verbose
+            --verbose 2>&1 | tee "$UPLOAD_LOG"
+          upload_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$upload_status" -ne 0 ]; then
+            if grep -qi "Upload limit reached" "$UPLOAD_LOG"; then
+              echo "::warning::App Store Connect rejected the upload because the app hit Apple's 24-hour upload quota. Skipping without failing the workflow."
+              {
+                echo "### TestFlight upload skipped"
+                echo
+                echo "App Store Connect returned: \`Upload limit reached. The upload limit for your application has been reached. Please wait 1 day and try again.\`"
+                echo
+                echo "The archive and IPA were built successfully, but Apple will not accept another upload for this app until the quota window resets."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            exit "$upload_status"
+          fi
 
           echo "[OK] Uploaded to TestFlight"
 
